@@ -49,7 +49,7 @@ $PY scripts/verify_all.py > runs/preflight_verify.log 2>&1 || \
 tail -2 runs/preflight_verify.log
 
 echo "=============================== 4. memory at the REAL lengths (the S2 configuration decision)"
-echo "--- training, chunked, 2 and 4 patched layers (differenced: the MARGINAL per-layer cost), head_block = ${HEAD_BLOCK:-2}"
+echo "--- training, chunked, 2 and 4 patched layers (differenced: the MARGINAL per-layer cost), head_block = $HEAD_BLOCK, chunk $CHUNK, L $L"
 # --targets 8192 only: NOTHING trains at 16K (E3 is evaluation-only), and gating a legitimate 8K training
 # configuration on an extrapolated 16K TRAINING peak no job incurs would block the queue for nothing
 # (review 30372ae D).  The 16K figure that matters is the evaluation one, measured in the third profile below.
