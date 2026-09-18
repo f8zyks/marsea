@@ -1,6 +1,26 @@
 import sys, os, pathlib
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+# The queue and preflight scripts read their run configuration from the environment (L, CHUNK, HEAD_BLOCK, STEPS, ...),
+# and the tests that run those scripts pin the DEFAULT launch lines and fixtures (a dense memory verdict at L = 8192,
+# `--head_block 2` in every eval job).  On pod 1 the operator had L=4096 CHUNK=2048 HEAD_BLOCK=0 exported for the
+# queue, preflight step 2 ran the suite in that shell, and four script tests failed on the operator's own knobs.  The
+# suite must not depend on the shell that runs it: the knobs are removed from this process's environment BEFORE marsea
+# is imported (the scripts are launched as subprocesses with dict(os.environ, ...); MARSEA_TOL_CAP is parsed when
+# marsea.invariants is imported, and the acceptance tests test the default numerics -- an override belongs to a run).
+RUN_KNOBS = ("L", "CHUNK", "HEAD_BLOCK", "STEPS", "MODE", "UNIFORM_L", "SKIP_DENSE_E9", "EXTENDED_E9",
+             "ALLOW_PHASE_A_LAYER_CHANGE", "EVAL_EVERY", "N16K", "N16K_PAD", "E3DEPTH_ARMS", "E3DEPTH_SEEDS",
+             "ALLOW_MISSING_ARMS", "SKIP_PAIRED_GATE", "GATE_GB", "REQUIRE_DATA", "EXPECT_NGPU", "MIN_GPU_MIB",
+             "NEED_RULER", "DATA_RULER", "DATA_MUSIQUE", "HOTPOT_N", "EVAL", "PREFLIGHT_FORCE_DETECTOR", "MARSEA_TOL_CAP")
+STRIPPED = {k: os.environ.pop(k) for k in RUN_KNOBS if k in os.environ}
+
+
+def pytest_report_header(config):
+    if STRIPPED:
+        return "run-configuration variables removed from the test environment: " + " ".join(
+            f"{k}={v}" for k, v in sorted(STRIPPED.items()))
+
 import numpy as np
 import torch
 import pytest

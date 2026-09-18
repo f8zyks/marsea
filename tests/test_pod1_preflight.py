@@ -107,3 +107,12 @@ def test_the_training_configuration_is_one_set_of_knobs_read_by_preflight_and_th
     assert "--lengths 4096 8192 16384" in ev and "--targets 8192 16384" in ev
     pm = (ROOT / "scripts/profile_memory.py").read_text()
     assert "for T in sorted(set(args.lengths))" in pm
+
+
+def test_the_suite_does_not_read_the_operators_run_knobs():
+    """preflight step 2 runs pytest in the shell that has L / CHUNK / HEAD_BLOCK exported for the queue (pod 1: four
+    script tests failed on them).  conftest strips the knobs from the process environment before any test runs."""
+    import os
+    from conftest import RUN_KNOBS
+    for k in ("L", "CHUNK", "HEAD_BLOCK", "STEPS", "MARSEA_TOL_CAP", "GATE_GB"):
+        assert k in RUN_KNOBS and k not in os.environ
