@@ -9,6 +9,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 FAKE_PY = r'''#!/usr/bin/env bash
 if [ "$1" = "-" ] || [ "$1" = "-c" ]; then exec "$REAL_PY" "$@"; fi
+if [ -n "$FAIL_MATCH" ] && [[ "$*" == *"$FAIL_MATCH"* ]]; then echo "$CUDA_VISIBLE_DEVICES $*" >> "$SIM/launch.log"; exit 1; fi
 exec 8>"$SIM/gpu$CUDA_VISIBLE_DEVICES.lock"
 flock -n 8 || echo "overlap on gpu $CUDA_VISIBLE_DEVICES" >> "$SIM/overlap.log"
 ( flock 9; echo "$CUDA_VISIBLE_DEVICES $*" >> "$SIM/launch.log" ) 9>"$SIM/launch.lock"
@@ -216,3 +217,46 @@ def test_two_pods_share_one_job_list_without_ever_launching_a_job_twice(tmp_path
     # the default (no MULTI_POD) never touches the claims directory
     r1, launches1, sim1 = _sim_s2(tmp_path / "solo", ngpu=4)
     assert r1.returncode == 0 and len(launches1) == 23 and not (sim1 / "runs/claims").exists()
+
+
+def test_slot_launcher_runs_every_job_once_one_per_gpu_and_reports_a_failure(tmp_path):
+    """S1 (pod 1): a MarSea arm is ~16 h, a softmax arm ~4 h; waves wait for their slowest member, slots do not."""
+    r, launches, sim = _sim_s2(tmp_path / "a", ngpu=4, extra_env={"LAUNCHER": "slots"})
+    assert r.returncode == 0, r.stdout[-1200:] + r.stderr[-1200:]
+    jobs = [l[1] for l in launches]
+    assert len(jobs) == 23 and len(set(jobs)) == 23
+    assert not (sim / "overlap.log").exists(), (sim / "overlap.log").read_text()      # never two jobs on one GPU at JOBS_PER_GPU=1
+    assert {int(l[0]) for l in launches} == {0, 1, 2, 3}
+    assert "wave drained" not in r.stdout and r.stdout.count("--- all slots drained") == 2 and r.stdout.count("--- done:") == 23
+    # same jobs, same order of first launches as the wave launcher
+    r_w, launches_w, _ = _sim_s2(tmp_path / "w", ngpu=4)
+    assert sorted(jobs) == sorted(l[1] for l in launches_w)
+    # a failing job is named, the rest still run, the queue exits 1
+    r, launches, _ = _sim_s2(tmp_path / "f", ngpu=4, extra_env={"LAUNCHER": "slots", "FAIL_MATCH": "--arm B2 --seed 1"})
+    assert r.returncode == 1 and "!! FAILED:" in r.stderr and "job(s) FAILED" in r.stderr
+    assert len(launches) == 23
+    # two per GPU, gated as in wave mode
+    ok = {"runs/preflight_train_chunked.json": {"gate": {"passed": True, "worst_GB": 25.5, "gate_GB": 125.0}},
+          "runs/preflight_train_dense.json": {"targets": [8192], "gate": {"passed": True, "worst_GB": 53.2, "gate_GB": 125.0}}}
+    r, launches, _ = _sim_s2(tmp_path / "j", ngpu=4, extra_env={"LAUNCHER": "slots", "JOBS_PER_GPU": "2"}, extra_files=ok)
+    assert r.returncode == 0 and len({l[1] for l in launches}) == 23
+    r, _, _ = _sim_s2(tmp_path / "bad", ngpu=4, extra_env={"LAUNCHER": "queue"})
+    assert r.returncode == 1 and "LAUNCHER must be" in r.stderr
+
+
+def test_static_shards_partition_phase_b_for_pods_on_different_volumes(tmp_path):
+    """A pod in another datacenter cannot mount the volume, so claims cannot reach it: SHARD=k/n splits the Phase-B
+    list by index, disjointly and completely; every shard verifies Phase A."""
+    got = []
+    for k in (0, 1):
+        r, launches, _ = _sim_s2(tmp_path / f"s{k}", ngpu=4, extra_env={"SHARD": f"{k}/2", "LAUNCHER": "slots"})
+        assert r.returncode == 0, r.stdout[-800:] + r.stderr[-800:]
+        assert sum(1 for l in launches if "--phase_a_only" in l[1]) == 3
+        got.append({l[1] for l in launches if "--phase_a_only" not in l[1]})
+        assert f"shard {k}/2 is done" in r.stdout
+    assert len(got[0]) == 10 and len(got[1]) == 10 and not (got[0] & got[1])
+    r_all, launches_all, _ = _sim_s2(tmp_path / "all", ngpu=4)
+    assert got[0] | got[1] == {l[1] for l in launches_all if "--phase_a_only" not in l[1]}
+    for bad in ("2/2", "x", "1"):
+        r, _, _ = _sim_s2(tmp_path / f"bad{bad.replace('/', '_')}", ngpu=4, extra_env={"SHARD": bad})
+        assert r.returncode == 1 and "SHARD must be" in r.stderr

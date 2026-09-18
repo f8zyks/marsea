@@ -184,8 +184,41 @@ fi
 # A bare `wait` returns 0 whatever the jobs did, so `set -e` never fired and the queue ran its whole Phase-B section
 # after every arm had crashed.  Each PID is waited on individually and its exit status recorded (review 30372ae D).
 LAUNCH_I=0; PIDS=(); PTAGS=(); FAILED_JOBS=()
+# LAUNCHER=slots (default: waves).  A wave lasts as long as its slowest job, and the grid mixes ~4 h softmax arms with
+# ~16 h MarSea arms (S1, pod 1, 2026-09-18: 28.5 s/step): five waves on four GPUs is ~80 h where the same jobs are ~66
+# slot-hours.  In slot mode a job starts the moment one of the NGPU x JOBS_PER_GPU slots frees (`wait -n -p`, bash >= 5.1,
+# as run_evalsuite.sh does); slot k sits on GPU k % NGPU, so a card never holds more than JOBS_PER_GPU jobs.
+LAUNCHER=${LAUNCHER:-waves}
+[[ "$LAUNCHER" == waves || "$LAUNCHER" == slots ]] || { echo "run_s2.sh: LAUNCHER must be waves or slots (got '$LAUNCHER')" >&2; exit 1; }
+if [ "$LAUNCHER" = "slots" ] && ! (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
+  echo "run_s2.sh: LAUNCHER=slots needs bash >= 5.1 (wait -n -p); this is $BASH_VERSION" >&2; exit 1
+fi
+SLOT_PID=(); SLOT_TAG=()
+reap_one() {                                 # wait for ANY running slot to finish; record a failure; free the slot
+  local pids=() i pid rc
+  for i in "${!SLOT_PID[@]}"; do [ -n "${SLOT_PID[$i]}" ] && pids+=("${SLOT_PID[$i]}"); done
+  [ ${#pids[@]} -gt 0 ] || return 0
+  if wait -n -p pid "${pids[@]}"; then rc=0; else rc=$?; fi
+  for i in "${!SLOT_PID[@]}"; do
+    if [ "${SLOT_PID[$i]}" = "$pid" ]; then
+      if [ $rc -ne 0 ]; then FAILED_JOBS+=("${SLOT_TAG[$i]}"); echo "!! FAILED: ${SLOT_TAG[$i]}  (runs/log_${SLOT_TAG[$i]}.txt)" >&2
+      else echo "--- done: ${SLOT_TAG[$i]} (slot $i, gpu $((i % NGPU)))"; fi
+      SLOT_PID[$i]=""; SLOT_TAG[$i]=""
+    fi
+  done
+}
 barrier() {
   local i
+  if [ "$LAUNCHER" = "slots" ]; then
+    while :; do
+      local busy=0
+      for i in "${!SLOT_PID[@]}"; do [ -n "${SLOT_PID[$i]}" ] && busy=1; done
+      [ $busy -eq 1 ] || break
+      reap_one
+    done
+    echo "--- all slots drained"
+    return 0
+  fi
   for i in "${!PIDS[@]}"; do
     if ! wait "${PIDS[$i]}"; then
       FAILED_JOBS+=("${PTAGS[$i]}"); echo "!! FAILED: ${PTAGS[$i]}  (runs/log_${PTAGS[$i]}.txt)" >&2
@@ -212,11 +245,37 @@ claim() {
   if mkdir "runs/claims/$1" 2>/dev/null; then echo "$POD_ID" > "runs/claims/$1/owner"; return 0; fi
   [ "$(cat "runs/claims/$1/owner" 2>/dev/null)" = "$POD_ID" ]
 }
+# SHARD=k/n: a STATIC split of the Phase-B job list for pods that do NOT share a volume (a pod in another datacenter
+# cannot mount this one, so MULTI_POD's claims cannot reach it).  Phase-B job i belongs to shard i % n; Phase A is
+# verified on every shard.  The shards' run directories are merged afterwards with rsync -- they never overlap.
+SHARD=${SHARD:-0/1}
+[[ "$SHARD" =~ ^([0-9]+)/([1-9][0-9]*)$ ]] && (( BASH_REMATCH[1] < BASH_REMATCH[2] )) || { echo "run_s2.sh: SHARD must be k/n with 0 <= k < n (got '$SHARD')" >&2; exit 1; }
+SHARD_K=${BASH_REMATCH[1]}; SHARD_N=${BASH_REMATCH[2]}; PHASE_B_I=0; SKIPPED_SHARD=()
 launch() {                                   # launch "<log tag>" <command...>: round-robins GPUs, barriers when full
   local tag="$1"; shift
+  if [[ "$tag" != phaseA_* ]]; then
+    local idx=$PHASE_B_I; PHASE_B_I=$((PHASE_B_I + 1))
+    if (( idx % SHARD_N != SHARD_K )); then
+      echo "[shard $((idx % SHARD_N))/$SHARD_N] $tag -- not this pod's (SHARD=$SHARD)"; SKIPPED_SHARD+=("$tag"); return 0
+    fi
+  fi
   if ! claim "$tag"; then
     echo "[claimed by $(cat "runs/claims/$tag/owner" 2>/dev/null || echo another pod)] $tag -- skipped here"
     SKIPPED_CLAIMED+=("$tag"); return 0
+  fi
+  if [ "$LAUNCHER" = "slots" ]; then
+    local nslots=$((NGPU * JOBS_PER_GPU)) slot=-1 i
+    while :; do
+      for ((i = 0; i < nslots; i++)); do
+        if [ -z "${SLOT_PID[$i]:-}" ]; then slot=$i; break; fi
+      done
+      [ $slot -ge 0 ] && break
+      reap_one
+    done
+    echo "[gpu $((slot % NGPU))] $tag"
+    CUDA_VISIBLE_DEVICES=$((slot % NGPU)) "$@" > "runs/log_${tag}.txt" 2>&1 &
+    SLOT_PID[$slot]=$!; SLOT_TAG[$slot]="$tag"
+    return 0
   fi
   local gpu=$((LAUNCH_I % NGPU)); LAUNCH_I=$((LAUNCH_I + 1))
   echo "[gpu $gpu] $tag"
@@ -302,6 +361,10 @@ for job in "${JOBS[@]}"; do
 done; barrier                                # drains the dense arms too: one round-robin, 8 / 8 / 4 on 8 GPUs
 if [ ${#FAILED_JOBS[@]} -gt 0 ]; then
   echo "=== ${#FAILED_JOBS[@]} job(s) FAILED:" >&2; printf '  %s\n' "${FAILED_JOBS[@]}" >&2; exit 1
+fi
+if [ ${#SKIPPED_SHARD[@]} -gt 0 ]; then
+  echo "S2: shard $SHARD is done; ${#SKIPPED_SHARD[@]} job(s) belong to the other shard(s).  Merge the run directories onto ONE"
+  echo "    volume before evaluation (rsync -r --size-only runs/ ...; the shards' directories never overlap)."
 fi
 if [ "$MULTI_POD" = "1" ] && [ ${#SKIPPED_CLAIMED[@]} -gt 0 ]; then
   echo "S2: THIS pod's share is done (POD_ID $POD_ID); ${#SKIPPED_CLAIMED[@]} job(s) belong to other pods -- the grid is complete"
