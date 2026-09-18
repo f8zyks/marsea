@@ -145,6 +145,39 @@ if [ "${SKIP_DENSE_E9:-0}" = "1" ]; then       # an `if`, not `[ ] && { }`: that
   DENSE_E9_OK=0; echo "SKIP_DENSE_E9=1: the uniform-quota, its control and the K_ret E9 arms are dropped by request"
 fi
 
+# ---------------------------------------------------------------- JOBS_PER_GPU: more than one trainer per card (default 1)
+# Measured on pod 1 (H200, L = 4096, 2026-09-18): a Phase-A trainer pegs ONE CPU core and leaves the GPU at 0-22 %
+# utilisation and 19 GB -- bound by Python and kernel-launch overhead on the mixture's short sequences, not by the
+# card.  With only a 4-GPU pod available, two jobs per GPU keep the 8 / 8 / 4 wave plan.  Guarded: the worst MEASURED
+# training peak (preflight's chunked profile, and the dense one when the dense arms run) times JOBS_PER_GPU must fit
+# under the same ceiling preflight gated one job against.  Preflight's step time is one job per card: with sharing,
+# read the real rate from the logs.  Numbers are unaffected -- each job is the same command on the same seed.
+JOBS_PER_GPU=${JOBS_PER_GPU:-1}
+[[ "$JOBS_PER_GPU" =~ ^[1-9][0-9]*$ ]] || { echo "run_s2.sh: JOBS_PER_GPU must be a positive integer (got '$JOBS_PER_GPU')" >&2; exit 1; }
+if [ "$JOBS_PER_GPU" != "1" ]; then
+  if ! $PY - "$JOBS_PER_GPU" "$DENSE_E9_OK" <<'PYEOF'
+import json, sys
+jpg, dense_runs = int(sys.argv[1]), sys.argv[2] == "1"
+bad, worst, gate = [], 0.0, None
+for name, need in (("preflight_train_chunked", True), ("preflight_train_dense", dense_runs)):
+    if not need:
+        continue
+    try:
+        g = json.load(open(f"runs/{name}.json"))["gate"]; w, gg = float(g["worst_GB"]), float(g["gate_GB"])
+    except Exception as e:
+        bad.append(f"runs/{name}.json carries no usable memory verdict ({e!r}); run preflight.sh"); continue
+    worst = max(worst, w); gate = gg if gate is None else min(gate, gg)
+if not bad and jpg * worst > gate:
+    bad.append(f"{jpg} jobs x {worst:.1f} GB (the worst measured training peak) = {jpg * worst:.1f} GB, over the {gate:.0f} GB ceiling")
+for b in bad:
+    print(f"REFUSING TO START: JOBS_PER_GPU = {jpg} --", b)
+if not bad:
+    print(f"JOBS_PER_GPU = {jpg}: {jpg} x {worst:.1f} GB = {jpg * worst:.1f} GB <= {gate:.0f} GB per GPU")
+sys.exit(1 if bad else 0)
+PYEOF
+  then exit 1; fi
+fi
+
 # ---------------------------------------------------------------- Phase A: once per seed, the FULL 500 steps, then stop
 # One process per GPU at a time.  `s % NGPU` alone put all three seeds on device 0 when NGPU = 1 -- three concurrent
 # trainers on one card, i.e. a guaranteed OOM on the single-GPU configuration preflight.sh sizes for.
@@ -158,6 +191,7 @@ barrier() {
       FAILED_JOBS+=("${PTAGS[$i]}"); echo "!! FAILED: ${PTAGS[$i]}  (runs/log_${PTAGS[$i]}.txt)" >&2
     fi
   done
+  if [ ${#PIDS[@]} -gt 0 ]; then echo "--- wave drained: ${#PIDS[@]} job(s)"; fi
   PIDS=(); PTAGS=()
   # a drained wave starts the GPU round-robin at 0 again.  LAUNCH_I used to carry over: Phase A's three launches
   # left it at 3, so wave 1 of Phase B held FIVE jobs on GPUs 3-7, the last chunked wave four, and the dense arms
@@ -170,7 +204,7 @@ launch() {                                   # launch "<log tag>" <command...>: 
   echo "[gpu $gpu] $tag"
   CUDA_VISIBLE_DEVICES=$gpu "$@" > "runs/log_${tag}.txt" 2>&1 &
   PIDS+=($!); PTAGS+=("$tag")
-  if (( LAUNCH_I % NGPU == 0 )); then barrier; fi
+  if (( LAUNCH_I % (NGPU * JOBS_PER_GPU) == 0 )); then barrier; fi      # a wave is NGPU x JOBS_PER_GPU jobs; job i sits on GPU i % NGPU
 }
 for s in 0 1 2; do
   launch "phaseA_seed$s" $PY scripts/run_train.py --arm B0 --seed $s $COMMON --phase_a_only

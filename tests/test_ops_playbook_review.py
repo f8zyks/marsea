@@ -17,7 +17,7 @@ exit 0
 '''
 
 
-def _sim_s2(tmp_path, ngpu=8, skip_dense=False, extra_env=None):
+def _sim_s2(tmp_path, ngpu=8, skip_dense=False, extra_env=None, extra_files=None):
     """run the real run_s2.sh past its gates with every trainer replaced by a recorder of CUDA_VISIBLE_DEVICES."""
     if shutil.which("flock") is None:
         pytest.skip("flock not available")
@@ -31,6 +31,8 @@ def _sim_s2(tmp_path, ngpu=8, skip_dense=False, extra_env=None):
     d = sim / "data/ruler/TRAIN_L8192_K1_V1_Q1_drand_s100"; d.mkdir(parents=True); (d / "validation.jsonl").write_text("{}\n")
     q = sim / "data/ruler/QUICK_L8192_K8_V1_Q1_d0.5_s3"; q.mkdir(parents=True); (q / "validation.jsonl").write_text("{}\n")
     (sim / "data/musique").mkdir(); (sim / "data/musique/musique_ans_v1.0_train.jsonl").write_text("{}\n")
+    for name, obj in (extra_files or {}).items():
+        (sim / name).write_text(json.dumps(obj))
     fake = sim / "fakepy"; fake.write_text(FAKE_PY); fake.chmod(0o755)
     env = dict(os.environ, PY=str(fake), SIM=str(sim), REAL_PY=sys.executable, HOTPOT_N="0", PYTHONPATH=str(ROOT),
                SKIP_DENSE_E9=("1" if skip_dense else "0"), **(extra_env or {}))
@@ -145,3 +147,35 @@ def test_phase_a_only_stops_before_phase_b_even_with_a_licence(tmp_path):
     assert len(launches) == 3 and all("--phase_a_only" in l[1] for l in launches), launches
     r2, launches2, _ = _sim_s2(tmp_path / "b")                       # the default is unchanged: Phase B runs
     assert r2.returncode == 0 and any("--phase_a_only" not in l[1] for l in launches2)
+
+
+def _waves(stdout):
+    return [int(ln.split(":")[1].split()[0]) for ln in stdout.splitlines() if ln.startswith("--- wave drained")]
+
+
+def test_jobs_per_gpu_keeps_the_8_8_4_plan_on_four_gpus_and_is_gated_on_measured_memory(tmp_path):
+    """Pod 1: a Phase-A trainer leaves the H200 at 0-22 % utilisation and 19 GB (host-bound on short sequences), and
+    only a 4-GPU pod may be available.  JOBS_PER_GPU=2 on 4 GPUs is the 8-GPU wave plan; it is refused unless
+    jobs x the worst measured training peak fits the ceiling preflight gated a single job against."""
+    ok = {"runs/preflight_train_chunked.json": {"gate": {"passed": True, "worst_GB": 25.5, "gate_GB": 125.0}},
+          "runs/preflight_train_dense.json": {"targets": [8192], "gate": {"passed": True, "worst_GB": 53.2, "gate_GB": 125.0}}}
+    r, launches, sim = _sim_s2(tmp_path / "a", ngpu=4, extra_env={"JOBS_PER_GPU": "2"}, extra_files=ok)
+    assert r.returncode == 0, r.stdout[-1200:] + r.stderr[-1200:]
+    assert "JOBS_PER_GPU = 2: 2 x 53.2 GB = 106.4 GB <= 125 GB per GPU" in r.stdout
+    assert _waves(r.stdout) == [3, 8, 8, 4], _waves(r.stdout)
+    plan = [ln for ln in r.stdout.splitlines() if ln.startswith("[gpu ") and "phaseA" not in ln]
+    assert [int(ln.split()[1].rstrip("]")) for ln in plan] == [i % 4 for i in range(20)]
+    # three per GPU: 3 x 53.2 = 159.6 GB does not fit
+    r, _, _ = _sim_s2(tmp_path / "b", ngpu=4, extra_env={"JOBS_PER_GPU": "3"}, extra_files=ok)
+    assert r.returncode == 1 and "REFUSING TO START: JOBS_PER_GPU = 3" in r.stdout and "159.6 GB" in r.stdout
+    # ... unless the dense arms are dropped: 3 x 25.5 = 76.5 GB
+    r, launches, _ = _sim_s2(tmp_path / "c", ngpu=4, skip_dense=True, extra_env={"JOBS_PER_GPU": "3"}, extra_files=ok)
+    assert r.returncode == 0 and _waves(r.stdout) == [3, 12, 5], (r.stdout[-600:], _waves(r.stdout))
+    # no measured verdict, no sharing
+    r, _, _ = _sim_s2(tmp_path / "d", ngpu=4, extra_env={"JOBS_PER_GPU": "2"})
+    assert r.returncode == 1 and "carries no usable memory verdict" in r.stdout
+    # the default is one job per GPU: 4 GPUs, five Phase-B waves of four
+    r, _, _ = _sim_s2(tmp_path / "e", ngpu=4)
+    assert r.returncode == 0 and _waves(r.stdout) == [3, 4, 4, 4, 4, 4], _waves(r.stdout)
+    r, _, _ = _sim_s2(tmp_path / "f", ngpu=4, extra_env={"JOBS_PER_GPU": "0"})
+    assert r.returncode == 1 and "positive integer" in r.stderr
