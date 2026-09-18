@@ -1,0 +1,282 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\newlabel{sec:intro}{{1}{1}{Introduction}{section.1}{}}
+\citation{martins2016softmax,peters2019sparse}
+\citation{sander2022sinkformers}
+\citation{sabour2017dynamic}
+\citation{zhang2023mesh}
+\@writefile{toc}{\contentsline {paragraph}{One scene, both margins.}{2}{section*.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Orientation.}{2}{section*.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Two obstructions, and MarSea.}{2}{section*.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Contributions.}{2}{section*.4}\protected@file@percent }
+\citation{hu2018relation,wu2021rethinking,gao2021fast,liu2022dab,hou2024relation}
+\citation{ye2024differential}
+\citation{sander2022sinkformers,shahbazi2025lotformer}
+\citation{locatello2020slot}
+\citation{tay2020sparse}
+\citation{zhang2023mesh}
+\citation{leviathan2024selective}
+\citation{zhou2022mixture}
+\citation{martins2016softmax,peters2019sparse,correia2019adaptively}
+\citation{niculae2017regularized,blondel2019fenchel}
+\citation{correia2019adaptively}
+\citation{velickovic2024softmax}
+\citation{liu2023lost}
+\citation{chowdhury2026birth,wu2025emergence,herasimchyk2026residual}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces \textbf  {The modelling object, and where every mechanism we know of sits in it.} A multivariate relation is carried by \emph  {both} margins, and on each margin it takes \emph  {two} predicted quantities: a \textbf  {capacity} --- how much influence the node may commit or absorb --- and a \textbf  {shape} --- how that influence is distributed over its incident edges, including which edges are \emph  {exactly} zero. Capacity without shape bounds a total but does not decide membership; shape without capacity redistributes a total the mechanism does not control. \emph  {Exclusivity is the pair, and no prior mechanism holds both cells on either margin.} ``learned$(k)$'' means a capacity predicted from the participant alone; ``inherited'' means taken from what an unmodified layer allocates, which is what makes an exclusive margin commensurate with a non-exclusive one (Prop.~\ref {prop:twostep}). \textbf  {MarSea claims the two shape cells and inherits the two capacities}; MESH is its mirror image, learning both capacities and predicting neither shape --- and only the shape cells produce the exact zeros that Prop.~\ref {prop:fullsupportceiling} keys on, which is why every ``dense'' row is pinned at $m_j/n_q$ however well its capacities are learned. $\dagger $ marks a mechanism that runs on a declared \emph  {part} of a margin rather than all of it.}}{3}{table.1}\protected@file@percent }
+\newlabel{tab:object}{{1}{3}{\textbf {The modelling object, and where every mechanism we know of sits in it.} A multivariate relation is carried by \emph {both} margins, and on each margin it takes \emph {two} predicted quantities: a \textbf {capacity} --- how much influence the node may commit or absorb --- and a \textbf {shape} --- how that influence is distributed over its incident edges, including which edges are \emph {exactly} zero. Capacity without shape bounds a total but does not decide membership; shape without capacity redistributes a total the mechanism does not control. \emph {Exclusivity is the pair, and no prior mechanism holds both cells on either margin.} ``learned$(k)$'' means a capacity predicted from the participant alone; ``inherited'' means taken from what an unmodified layer allocates, which is what makes an exclusive margin commensurate with a non-exclusive one (Prop.~\ref {prop:twostep}). \textbf {MarSea claims the two shape cells and inherits the two capacities}; MESH is its mirror image, learning both capacities and predicting neither shape --- and only the shape cells produce the exact zeros that Prop.~\ref {prop:fullsupportceiling} keys on, which is why every ``dense'' row is pinned at $m_j/n_q$ however well its capacities are learned. $\dagger $ marks a mechanism that runs on a declared \emph {part} of a margin rather than all of it}{table.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Related work.}{3}{section*.5}\protected@file@percent }
+\citation{martins2016softmax,peters2019sparse}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Method}{4}{section.2}\protected@file@percent }
+\newlabel{sec:method}{{2}{4}{Method}{section.2}{}}
+\newlabel{eq:scores}{{1}{4}{Method}{equation.2.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Stage 1: the fan-out program}{4}{subsection.2.1}\protected@file@percent }
+\newlabel{sec:method-fanout}{{2.1}{4}{Stage 1: the fan-out program}{subsection.2.1}{}}
+\newlabel{eq:step1}{{2}{4}{Stage 1: the fan-out program}{equation.2.2}{}}
+\newlabel{eq:program}{{3}{4}{Stage 1: the fan-out program}{equation.2.3}{}}
+\newlabel{eq:affine}{{4}{5}{Stage 1: the fan-out program}{equation.2.4}{}}
+\newlabel{eq:tauhead}{{5}{5}{Stage 1: the fan-out program}{equation.2.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{What the two steps do and do not claim.}{5}{section*.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Stage 2: the fan-in program}{5}{subsection.2.2}\protected@file@percent }
+\newlabel{sec:method-fanin}{{2.2}{5}{Stage 2: the fan-in program}{subsection.2.2}{}}
+\newlabel{eq:rowstep1}{{6}{5}{Stage 2: the fan-in program}{equation.2.6}{}}
+\citation{miller2023attention}
+\citation{xiao2024efficient}
+\newlabel{eq:rowprog}{{7}{6}{Stage 2: the fan-in program}{equation.2.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Conditional activation is the relation}{6}{subsection.2.3}\protected@file@percent }
+\newlabel{sec:method-gate}{{2.3}{6}{Conditional activation is the relation}{subsection.2.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.4}Scaling: blocking for incrementality, hierarchical selection for scale}{7}{subsection.2.4}\protected@file@percent }
+\newlabel{sec:method-scale}{{2.4}{7}{Scaling: blocking for incrementality, hierarchical selection for scale}{subsection.2.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.5}Causal form: the program over a visible prefix}{7}{subsection.2.5}\protected@file@percent }
+\newlabel{sec:method-causal}{{2.5}{7}{Causal form: the program over a visible prefix}{subsection.2.5}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3}Theory}{7}{section.3}\protected@file@percent }
+\newlabel{sec:theory}{{3}{7}{Theory}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Two obstructions}{7}{subsection.3.1}\protected@file@percent }
+\newlabel{def:qlocal}{{1}{7}{Query-locality, and product form}{definition.1}{}}
+\newlabel{thm:separation}{{1}{8}{Query-local schemes attain exactly a product set}{theorem.1}{}}
+\newlabel{eq:product}{{8}{8}{Query-local schemes attain exactly a product set}{equation.3.8}{}}
+\newlabel{ass:richness}{{1}{8}{Non-degenerate replication}{assumption.1}{}}
+\newlabel{cor:capacity}{{1}{8}{Cardinality fails, and fails on real inputs}{corollary.1}{}}
+\newlabel{prop:conservation}{{1}{8}{Conservation obstruction}{proposition.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{How hard the second bites depends on the shape of the attention, and the mechanism is defined for all of them.}{8}{section*.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}What the two steps guarantee, and what shrinking a relation does}{9}{subsection.3.2}\protected@file@percent }
+\newlabel{prop:twostep}{{2}{9}{The two-step form conserves and cannot relocate}{proposition.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Why (iii) is stated against the row's own mass, and what that buys in finite precision.}{9}{section*.8}\protected@file@percent }
+\newlabel{eq:excess}{{9}{9}{Why (iii) is stated against the row's own mass, and what that buys in finite precision}{equation.3.9}{}}
+\newlabel{prop:scopemono}{{3}{9}{Shrinking a relation only helps}{proposition.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Structure of the fan-out program}{10}{subsection.3.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}What is realizable, and where the difficulty lies}{10}{subsection.3.4}\protected@file@percent }
+\newlabel{sec:competitive}{{3.4}{10}{What is realizable, and where the difficulty lies}{subsection.3.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.5}Exact recovery}{10}{subsection.3.5}\protected@file@percent }
+\newlabel{sec:recovery}{{3.5}{10}{Exact recovery}{subsection.3.5}{}}
+\newlabel{ass:margin}{{2}{10}{Margin and spread}{assumption.2}{}}
+\newlabel{thm:recovery}{{2}{10}{Exact support recovery, with sharp endpoints}{theorem.2}{}}
+\newlabel{eq:interval}{{10}{10}{Exact support recovery, with sharp endpoints}{equation.3.10}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.6}Fidelity: precision and recall on both margins}{10}{subsection.3.6}\protected@file@percent }
+\newlabel{sec:fidelity}{{3.6}{10}{Fidelity: precision and recall on both margins}{subsection.3.6}{}}
+\newlabel{def:fidelity}{{2}{11}{Support precision and recall, both margins}{definition.2}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces \textbf  {The trace is predicted in full.} Stage 1 at $400$ temperatures, one column, $n_q\!=\!64$, $m_j\!=\!4$. Full support is the grey square, at \emph  {every} $\tau _j$.}}{11}{figure.1}\protected@file@percent }
+\newlabel{fig:prcurve}{{1}{11}{\textbf {The trace is predicted in full.} Stage 1 at $400$ temperatures, one column, $n_q\!=\!64$, $m_j\!=\!4$. Full support is the grey square, at \emph {every} $\tau _j$}{figure.1}{}}
+\newlabel{cor:joint}{{2}{11}{Both quantities, both margins, simultaneously}{corollary.2}{}}
+\citation{chowdhury2026birth,wu2025emergence,herasimchyk2026residual}
+\citation{wu2024retrieval}
+\citation{hsieh2024ruler}
+\citation{trivedi2022musique}
+\citation{yang2018hotpotqa}
+\citation{zhang2025iheval}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Application: multivariate evidence selection}{12}{section.4}\protected@file@percent }
+\newlabel{sec:apps}{{4}{12}{Application: multivariate evidence selection}{section.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Experiments}{12}{section.5}\protected@file@percent }
+\newlabel{sec:experiments}{{5}{12}{Experiments}{section.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{Setup.}{12}{section*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Datasets, and what each is for.}{12}{section*.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Baselines.}{12}{section*.11}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces \textbf  {E1, the replication probe.} \textbf  {(a)} The true relation size is held at $m_j=4$ and the candidate set $|\mathcal  {E}_{\cdot j}|$ grows from $4$ to $256$; $12$ seeds, $\tau _j$ taken inside Thm.~\ref {thm:recovery}'s interval. \textbf  {The measured quantity is degree, not mass}: by equation~\ref {eq:step1} the mass is inherited from an unmodified layer, so a mass sweep would show MarSea tracking softmax and would be the wrong instrument. Solid, left axis: fan-out degree. Any full-support scheme reaches every candidate (slope $+1$); MarSea holds $4.00$ throughout (slope $-0.0000$), which is Cor.~\ref {cor:capacity}'s cardinality half. Dashed, right axis: precision, which for the comparator is $P_j=m_j/|\mathcal  {E}_{\cdot j}|$ at \emph  {every} temperature and scoring function (Prop.~\ref {prop:fullsupportceiling}) --- an identity, not a tendency --- and $1.000$ for MarSea. \textbf  {(b)} The one link that is not an identity. With the capacity inherited, $\tau _j$ carries the whole fan-out claim and must place $k^\star $ at $m_j$; its head reads $\nu _j=\|p_{\cdot j}\|_2^{-2}$, and whether $\nu _j$ tracks $m_j$ depends on $\tau _j$ and the column. Six keys, true sizes $1$--$32$ at $n_q=63$, error bars one standard deviation. Under a per-key $\tau _j$ inside its interval it tracks; under one global $\tau $ it saturates, which is Cor.~\ref {cor:necessity} in training-free form. Both panels are training-free possibility results. Reproduced by \texttt  {v1\_probe.py}.}}{13}{figure.2}\protected@file@percent }
+\newlabel{fig:probe}{{2}{13}{\textbf {E1, the replication probe.} \textbf {(a)} The true relation size is held at $m_j=4$ and the candidate set $|\mathcal {E}_{\cdot j}|$ grows from $4$ to $256$; $12$ seeds, $\tau _j$ taken inside Thm.~\ref {thm:recovery}'s interval. \textbf {The measured quantity is degree, not mass}: by \eqref {eq:step1} the mass is inherited from an unmodified layer, so a mass sweep would show MarSea tracking softmax and would be the wrong instrument. Solid, left axis: fan-out degree. Any full-support scheme reaches every candidate (slope $+1$); MarSea holds $4.00$ throughout (slope $-0.0000$), which is Cor.~\ref {cor:capacity}'s cardinality half. Dashed, right axis: precision, which for the comparator is $P_j=m_j/|\mathcal {E}_{\cdot j}|$ at \emph {every} temperature and scoring function (Prop.~\ref {prop:fullsupportceiling}) --- an identity, not a tendency --- and $1.000$ for MarSea. \textbf {(b)} The one link that is not an identity. With the capacity inherited, $\tau _j$ carries the whole fan-out claim and must place $k^\star $ at $m_j$; its head reads $\nu _j=\|p_{\cdot j}\|_2^{-2}$, and whether $\nu _j$ tracks $m_j$ depends on $\tau _j$ and the column. Six keys, true sizes $1$--$32$ at $n_q=63$, error bars one standard deviation. Under a per-key $\tau _j$ inside its interval it tracks; under one global $\tau $ it saturates, which is Cor.~\ref {cor:necessity} in training-free form. Both panels are training-free possibility results. Reproduced by \texttt {v1\_probe.py}}{figure.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{E1 --- the replication probe (run).}{13}{section*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{E2 --- the $m$-sweep at fixed $n$ (a Thm.~\ref {thm:recovery} test).}{13}{section*.13}\protected@file@percent }
+\citation{du2025context}
+\citation{chowdhury2026birth}
+\citation{zhang2023mesh}
+\@writefile{toc}{\contentsline {paragraph}{E3 --- the $n$-sweep at fixed $m$ (load-bearing).}{14}{section*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{E3, continued --- controls and what is reported.}{14}{section*.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{E4--E9 --- controls, externalisation, fidelity, diagnostics, ablations.}{14}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Limitations.}{14}{section*.17}\protected@file@percent }
+\bibdata{marsea_iclr}
+\bibcite{berthet2020perturbed}{{1}{2020}{{Berthet et~al.}}{{Berthet, Blondel, Teboul, Cuturi, Vert, and Bach}}}
+\bibcite{blondel2019fenchel}{{2}{2020}{{Blondel et~al.}}{{Blondel, Martins, and Niculae}}}
+\bibcite{carion2020end}{{3}{2020}{{Carion et~al.}}{{Carion, Massa, Synnaeve, Usunier, Kirillov, and Zagoruyko}}}
+\bibcite{chowdhury2026birth}{{4}{2026}{{Chowdhury}}{{}}}
+\bibcite{correia2019adaptively}{{5}{2019}{{Correia et~al.}}{{Correia, Niculae, and Martins}}}
+\bibcite{du2025context}{{6}{2025}{{Du et~al.}}{{Du, Tian, Ronanki, Rongali, Bodapati, Galstyan, Wells, Schwartz, Huerta, and Peng}}}
+\bibcite{fedus2022switch}{{7}{2022}{{Fedus et~al.}}{{Fedus, Zoph, and Shazeer}}}
+\bibcite{gao2021fast}{{8}{2021}{{Gao et~al.}}{{Gao, Zheng, Wang, Dai, and Li}}}
+\bibcite{herasimchyk2026residual}{{9}{2026}{{Herasimchyk et~al.}}{{Herasimchyk, Labryga, Prusina, and Laue}}}
+\bibcite{hou2024relation}{{10}{2024}{{Hou et~al.}}{{Hou, Liu, Zhang, Wei, Chen, and Lan}}}
+\bibcite{hsieh2024ruler}{{11}{2024}{{Hsieh et~al.}}{{Hsieh, Sun, Kriman, Acharya, Rekesh, Jia, Zhang, and Ginsburg}}}
+\bibcite{hu2018relation}{{12}{2018}{{Hu et~al.}}{{Hu, Gu, Zhang, Dai, and Wei}}}
+\bibcite{lepikhin2021gshard}{{13}{2021}{{Lepikhin et~al.}}{{Lepikhin, Lee, Xu, Chen, Firat, Huang, Krikun, Shazeer, and Chen}}}
+\bibcite{leviathan2024selective}{{14}{2025}{{Leviathan et~al.}}{{Leviathan, Kalman, and Matias}}}
+\bibcite{liu2022dab}{{15}{2022}{{Liu et~al.}}{{Liu, Li, Zhang, Yang, Qi, Su, Zhu, and Zhang}}}
+\bibcite{liu2023lost}{{16}{2024}{{Liu et~al.}}{{Liu, Lin, Hewitt, Paranjape, Bevilacqua, Petroni, and Liang}}}
+\bibcite{locatello2020slot}{{17}{2020}{{Locatello et~al.}}{{Locatello, Weissenborn, Unterthiner, Mahendran, Heigold, Uszkoreit, Dosovitskiy, and Kipf}}}
+\bibcite{martins2016softmax}{{18}{2016}{{Martins \& Astudillo}}{{Martins and Astudillo}}}
+\bibcite{miller2023attention}{{19}{2023}{{Miller}}{{}}}
+\bibcite{min2019compositional}{{20}{2019}{{Min et~al.}}{{Min, Wallace, Singh, Gardner, Hajishirzi, and Zettlemoyer}}}
+\bibcite{niculae2017regularized}{{21}{2017}{{Niculae \& Blondel}}{{Niculae and Blondel}}}
+\bibcite{peters2019sparse}{{22}{2019}{{Peters et~al.}}{{Peters, Niculae, and Martins}}}
+\bibcite{sabour2017dynamic}{{23}{2017}{{Sabour et~al.}}{{Sabour, Frosst, and Hinton}}}
+\bibcite{sander2022sinkformers}{{24}{2022}{{Sander et~al.}}{{Sander, Ablin, Blondel, and Peyr{\'e}}}}
+\bibcite{sanford2023representational}{{25}{2023}{{Sanford et~al.}}{{Sanford, Hsu, and Telgarsky}}}
+\bibcite{shahbazi2025lotformer}{{26}{2025}{{Shahbazi et~al.}}{{Shahbazi, Thrash, Bai, Hamm, NaderiAlizadeh, and Kolouri}}}
+\bibcite{tay2020sparse}{{27}{2020}{{Tay et~al.}}{{Tay, Bahri, Yang, Metzler, and Juan}}}
+\bibcite{trivedi2022musique}{{28}{2022}{{Trivedi et~al.}}{{Trivedi, Balasubramanian, Khot, and Sabharwal}}}
+\bibcite{velickovic2024softmax}{{29}{2025}{{Veli{\v {c}}kovi{\'c} et~al.}}{{Veli{\v {c}}kovi{\'c}, Perivolaropoulos, Barbero, and Pascanu}}}
+\bibcite{wu2021rethinking}{{30}{2021}{{Wu et~al.}}{{Wu, Peng, Chen, Fu, and Chao}}}
+\bibcite{wu2024retrieval}{{31}{2024}{{Wu et~al.}}{{Wu, Wang, Xiao, Peng, and Fu}}}
+\bibcite{wu2025emergence}{{32}{2025}{{Wu et~al.}}{{Wu, Wang, Jegelka, and Jadbabaie}}}
+\bibcite{xiao2024efficient}{{33}{2024}{{Xiao et~al.}}{{Xiao, Tian, Chen, Han, and Lewis}}}
+\bibcite{xie2020differentiable}{{34}{2020}{{Xie et~al.}}{{Xie, Dai, Chen, Dai, Zhao, Zha, Wei, and Pfister}}}
+\bibcite{yang2018hotpotqa}{{35}{2018}{{Yang et~al.}}{{Yang, Qi, Zhang, Bengio, Cohen, Salakhutdinov, and Manning}}}
+\bibcite{ye2024differential}{{36}{2025}{{Ye et~al.}}{{Ye, Dong, Xia, Sun, Zhu, Huang, and Wei}}}
+\bibcite{yen2025helmet}{{37}{2025}{{Yen et~al.}}{{Yen, Gao, Hou, Ding, Fleischer, Izsak, Wasserblat, and Chen}}}
+\bibcite{yue2024adak}{{38}{2025}{{Yue et~al.}}{{Yue, Guo, Cheng, Gao, and Liu}}}
+\bibcite{zhang2023mesh}{{39}{2023}{{Zhang et~al.}}{{Zhang, Zhang, Lacoste-Julien, Burghouts, and Snoek}}}
+\bibcite{zhang2025iheval}{{40}{2025}{{Zhang et~al.}}{{Zhang, Li, Zhang, Liu, Jiang, Tang, Gao, Li, Wang, Tan, Li, Yin, Yin, and Jiang}}}
+\bibcite{zhou2022mixture}{{41}{2022}{{Zhou et~al.}}{{Zhou, Lei, Liu, Du, Huang, Zhao, Dai, Chen, Le, and Laudon}}}
+\bibstyle{iclr2027_conference}
+\@writefile{toc}{\contentsline {section}{\numberline {A}Notation and component summary}{17}{appendix.A}\protected@file@percent }
+\newlabel{app:notation}{{A}{17}{Notation and component summary}{appendix.A}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces The components. Every guarantee is scoped to the relation.}}{18}{table.2}\protected@file@percent }
+\newlabel{tab:stages}{{2}{18}{The components. Every guarantee is scoped to the relation}{table.2}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Notation. Read each row as a left pair, then a right pair. In the fidelity group the left column is the fan-out (column) side and the right column the fan-in (row) side.}}{18}{table.3}\protected@file@percent }
+\newlabel{tab:notation}{{3}{18}{Notation. Read each row as a left pair, then a right pair. In the fidelity group the left column is the fan-out (column) side and the right column the fan-in (row) side}{table.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {B}Blocking and hierarchical selection}{18}{appendix.B}\protected@file@percent }
+\newlabel{app:scaling}{{B}{18}{Blocking and hierarchical selection}{appendix.B}{}}
+\citation{hu2018relation,wu2021rethinking,gao2021fast,liu2022dab,hou2024relation}
+\citation{ye2024differential}
+\citation{sander2022sinkformers}
+\citation{tay2020sparse}
+\citation{shahbazi2025lotformer}
+\citation{tay2020sparse}
+\citation{sander2022sinkformers}
+\citation{shahbazi2025lotformer}
+\citation{locatello2020slot}
+\citation{zhang2023mesh}
+\@writefile{toc}{\contentsline {section}{\numberline {C}Related work in full}{19}{appendix.C}\protected@file@percent }
+\newlabel{app:related}{{C}{19}{Related work in full}{appendix.C}{}}
+\newlabel{sec:related}{{C}{19}{Related work in full}{appendix.C}{}}
+\@writefile{toc}{\contentsline {paragraph}{Geometry in scores, and other query-local remedies.}{19}{section*.21}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Transport-based attention, and Slot Attention as its closest relative to Stage 1.}{19}{section*.22}\protected@file@percent }
+\citation{zhang2023mesh}
+\citation{leviathan2024selective}
+\citation{lepikhin2021gshard,fedus2022switch}
+\citation{zhou2022mixture}
+\citation{zhou2022mixture}
+\citation{yue2024adak}
+\@writefile{toc}{\contentsline {paragraph}{Query coupling without a constraint.}{20}{section*.23}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Capacity in routing, and the correction we owe expert choice.}{20}{section*.24}\protected@file@percent }
+\citation{martins2016softmax}
+\citation{peters2019sparse}
+\citation{correia2019adaptively}
+\citation{niculae2017regularized}
+\citation{blondel2019fenchel}
+\citation{correia2019adaptively}
+\citation{xie2020differentiable}
+\citation{berthet2020perturbed}
+\citation{velickovic2024softmax}
+\citation{sanford2023representational}
+\citation{carion2020end}
+\citation{sabour2017dynamic}
+\citation{xiao2024efficient}
+\@writefile{toc}{\contentsline {paragraph}{Sparse attention, and why we need no relaxation.}{21}{section*.25}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Softmax disperses, which is our motivating claim by a cleaner route.}{21}{section*.26}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Representational separations for attention.}{21}{section*.27}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Assignment, agreement, and efficiency.}{21}{section*.28}\protected@file@percent }
+\citation{liu2023lost}
+\citation{chowdhury2026birth,wu2025emergence,herasimchyk2026residual}
+\citation{chowdhury2026birth}
+\citation{wu2025emergence}
+\citation{herasimchyk2026residual}
+\@writefile{toc}{\contentsline {paragraph}{Position bias.}{22}{section*.29}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {D}Limitations, continued}{22}{appendix.D}\protected@file@percent }
+\newlabel{app:limitations}{{D}{22}{Limitations, continued}{appendix.D}{}}
+\@writefile{toc}{\contentsline {paragraph}{The four stated in Sec.~\ref {sec:experiments}, in full.}{22}{section*.30}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The positional account, and why it is a different claim.}{22}{section*.31}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The failure-path tally, and what it omits.}{22}{section*.32}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Why independent per-target selection over-commits a source.}{22}{section*.33}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Thm.~\ref {thm:separation}'s hypotheses, in self-attention.}{22}{section*.34}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Why the margins do not share a head.}{23}{section*.35}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {E}Selective exclusivity: scoping both programs to a relation}{24}{appendix.E}\protected@file@percent }
+\newlabel{app:selective}{{E}{24}{Selective exclusivity: scoping both programs to a relation}{appendix.E}{}}
+\@writefile{toc}{\contentsline {paragraph}{The generalization.}{24}{section*.36}\protected@file@percent }
+\newlabel{eq:subgraph}{{11}{24}{The generalization}{equation.E.11}{}}
+\@writefile{toc}{\contentsline {paragraph}{What transfers.}{25}{section*.37}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Restriction of both programs to an exclusive subgraph, statement by statement. Rows in the last group are the ones a development of this idea would owe a proof.}}{25}{table.4}\protected@file@percent }
+\newlabel{tab:transfer}{{4}{25}{Restriction of both programs to an exclusive subgraph, statement by statement. Rows in the last group are the ones a development of this idea would owe a proof}{table.4}{}}
+\@writefile{toc}{\contentsline {paragraph}{Why: $n_q$ enters the theory in exactly one place.}{25}{section*.38}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{What this settles about the comparison with softmax, and what it does not.}{25}{section*.39}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Margin and exact recovery against candidate count, at $|\mathcal  {E}_{\cdot j}|=8$, $m_j=3$, non-targets outside the scope drawn $\mathcal  {N}(-2,1)$; $3000$ columns per row, $\tau _j$ taken inside the scope's interval. The scope margin is identical across rows by construction; the column margin is not. \textbf  {Both $\delta _j$ columns are means, and the recovery columns are not a function of them}, which is the honest way to read the table: recovery is per column, and Assumption~\ref {ass:margin} fails on a growing \emph  {fraction} of columns rather than switching off at a threshold. Already at $n_q=32$, where the mean margin is still positive, $26.5\%$ of columns have $\delta _j\le 0$ and can be recovered at no temperature; at $n_q=128$, where the mean has gone negative, $24.5\%$ still satisfy the assumption, which is what the residual $14.9\%$ is made of. The scope column is $100\%$ at every $n_q$ because the max defining $\delta _j$ is taken over a set that does not grow.}}{26}{table.5}\protected@file@percent }
+\newlabel{tab:margin}{{5}{26}{Margin and exact recovery against candidate count, at $|\mathcal {E}_{\cdot j}|=8$, $m_j=3$, non-targets outside the scope drawn $\mathcal {N}(-2,1)$; $3000$ columns per row, $\tau _j$ taken inside the scope's interval. The scope margin is identical across rows by construction; the column margin is not. \textbf {Both $\delta _j$ columns are means, and the recovery columns are not a function of them}, which is the honest way to read the table: recovery is per column, and Assumption~\ref {ass:margin} fails on a growing \emph {fraction} of columns rather than switching off at a threshold. Already at $n_q=32$, where the mean margin is still positive, $26.5\%$ of columns have $\delta _j\le 0$ and can be recovered at no temperature; at $n_q=128$, where the mean has gone negative, $24.5\%$ still satisfy the assumption, which is what the residual $14.9\%$ is made of. The scope column is $100\%$ at every $n_q$ because the max defining $\delta _j$ is taken over a set that does not grow}{table.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{What it costs, and what it no longer costs.}{26}{section*.40}\protected@file@percent }
+\citation{martins2016softmax,peters2019sparse}
+\@writefile{toc}{\contentsline {paragraph}{How the mask must be parameterized, and why that is not a retreat.}{27}{section*.41}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Where it helps least.}{27}{section*.42}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Numerical check of the transfer.}{27}{section*.43}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {F}Proofs}{27}{appendix.F}\protected@file@percent }
+\newlabel{app:proofs}{{F}{27}{Proofs}{appendix.F}{}}
+\newlabel{lem:prefix}{{1}{27}{Prefix property}{lemma.1}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {6}{\ignorespaces Restriction to a scope, checked. Zero violations throughout, with $^{\dagger }$ as in Table~\ref {tab:verification}. The fourth row is run once rather than at each $n_q$: the scope recovery check does not depend on $n_q$ --- the pool outside the scope never enters it --- so repeating it six times would report one result as six. \textbf  {That $n_q$-invariance is the appendix's point and it is structural, not empirical}; what varies with $n_q$ is the \emph  {full-column} comparison, which is Table~\ref {tab:margin}. The last row confirms a \emph  {negative} --- that the $n_q/n_k$ bound is escaped once mass may sit off $\mathcal  {E}$; that it is escaped at all is arranged by the mask density the generator draws, so the row shows the bound is not automatic, not how far it falls. The harness separately prints the rate at which a revocable scope breaks permanence of exclusion, which the fifth row's hypothesis excludes.}}{28}{table.6}\protected@file@percent }
+\newlabel{tab:transferchecks}{{6}{28}{Restriction to a scope, checked. Zero violations throughout, with $^{\dagger }$ as in Table~\ref {tab:verification}. The fourth row is run once rather than at each $n_q$: the scope recovery check does not depend on $n_q$ --- the pool outside the scope never enters it --- so repeating it six times would report one result as six. \textbf {That $n_q$-invariance is the appendix's point and it is structural, not empirical}; what varies with $n_q$ is the \emph {full-column} comparison, which is Table~\ref {tab:margin}. The last row confirms a \emph {negative} --- that the $n_q/n_k$ bound is escaped once mass may sit off $\mathcal {E}$; that it is escaped at all is arranged by the mask density the generator draws, so the row shows the bound is not automatic, not how far it falls. The harness separately prints the rate at which a revocable scope breaks permanence of exclusion, which the fifth row's hypothesis excludes}{table.6}{}}
+\@writefile{toc}{\contentsline {paragraph}{Monotone exclusivity.}{28}{section*.44}\protected@file@percent }
+\newlabel{prop:realizability}{{4}{29}{Every competitive selection is realizable}{proposition.4}{}}
+\citation{martins2016softmax}
+\newlabel{prop:scope}{{5}{30}{Selection is local; scope-respecting selection is not}{proposition.5}{}}
+\newlabel{cor:necessity}{{3}{31}{Content-dependent exclusivity is necessary}{corollary.3}{}}
+\newlabel{prop:fullsupportceiling}{{6}{32}{The precision ceiling of full support}{proposition.6}{}}
+\newlabel{prop:printerval}{{7}{32}{The recovery interval is a precision--recall interval}{proposition.7}{}}
+\newlabel{prop:graded}{{8}{32}{Graded degradation, both margins, weakest-first}{proposition.8}{}}
+\newlabel{prop:stagecomp}{{9}{33}{Composition of the two stages}{proposition.9}{}}
+\newlabel{prop:leakage}{{10}{33}{A smooth column dilutes with the candidate set}{proposition.10}{}}
+\newlabel{prop:tournament}{{11}{34}{Exactness of hierarchical selection, and fidelity under retention}{proposition.11}{}}
+\newlabel{prop:prefix}{{12}{34}{Prefix monotonicity: growth is edge-removing}{proposition.12}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {G}Numerical verification of the analytical claims}{36}{appendix.G}\protected@file@percent }
+\newlabel{app:numerics}{{G}{36}{Numerical verification of the analytical claims}{appendix.G}{}}
+\@writefile{toc}{\contentsline {paragraph}{Protocol.}{36}{section*.45}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{One check is about the device rather than the mechanism, and we separate it.}{36}{section*.46}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{How large must $K$ be?}{36}{section*.47}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {7}{\ignorespaces Verification of the analytical claims. Denominators are \textbf  {evaluations}, not columns: a column swept at four temperatures contributes four. \textbf  {$^{\dagger }$ marks a row whose conclusion follows from how the generator builds its input}, so it can confirm an algebraic identity but cannot fail --- see App.~\ref {app:numerics}, which says what each of these does and does not test. \textbf  {$^{\ddagger }$ marks a row that re-expresses evaluations already counted} in the Thm.~\ref {thm:recovery} sharpness rows. No column is discarded for failing a claim; rows testing the regime above $1/W_j$ count only the columns for which that regime exists ($W_j>0$), which is why three denominators fall short of the columns drawn. App.~\ref {app:selective} is checked separately in Table~\ref {tab:transferchecks}.}}{37}{table.7}\protected@file@percent }
+\newlabel{tab:verification}{{7}{37}{Verification of the analytical claims. Denominators are \textbf {evaluations}, not columns: a column swept at four temperatures contributes four. \textbf {$^{\dagger }$ marks a row whose conclusion follows from how the generator builds its input}, so it can confirm an algebraic identity but cannot fail --- see App.~\ref {app:numerics}, which says what each of these does and does not test. \textbf {$^{\ddagger }$ marks a row that re-expresses evaluations already counted} in the Thm.~\ref {thm:recovery} sharpness rows. No column is discarded for failing a claim; rows testing the regime above $1/W_j$ count only the columns for which that regime exists ($W_j>0$), which is why three denominators fall short of the columns drawn. App.~\ref {app:selective} is checked separately in Table~\ref {tab:transferchecks}}{table.7}{}}
+\@writefile{toc}{\contentsline {paragraph}{Why some rows need few trials, and why the counts are not comparable.}{37}{section*.48}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The row checks and $\tau _i$.}{38}{section*.49}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{What the daggered rows do and do not test, and why we mark them.}{38}{section*.50}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{What none of it establishes.}{38}{section*.51}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {H}Experimental protocol in full}{38}{appendix.H}\protected@file@percent }
+\newlabel{app:expprotocol}{{H}{38}{Experimental protocol in full}{appendix.H}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {8}{\ignorespaces Estimated single-GPU cost. H100-hours, $\pm 50\%$ per item; the per-stage figures are run estimates and the $1.5\times $ debugging allowance is applied once, at the bottom, so the column sums as printed. Runs within a stage parallelize across a node.}}{38}{table.8}\protected@file@percent }
+\newlabel{tab:compute}{{8}{38}{Estimated single-GPU cost. H100-hours, $\pm 50\%$ per item; the per-stage figures are run estimates and the $1.5\times $ debugging allowance is applied once, at the bottom, so the column sums as printed. Runs within a stage parallelize across a node}{table.8}{}}
+\citation{miller2023attention}
+\citation{peters2019sparse}
+\citation{zhang2023mesh}
+\@writefile{toc}{\contentsline {paragraph}{Staging.}{39}{section*.52}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{E1, construction.}{39}{section*.53}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{E4, E5 and E6 in full.}{39}{section*.54}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Grids.}{39}{section*.55}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Baselines, in full.}{39}{section*.56}\protected@file@percent }
+\citation{yang2018hotpotqa}
+\citation{trivedi2022musique}
+\citation{hsieh2024ruler}
+\citation{zhang2025iheval}
+\@writefile{toc}{\contentsline {paragraph}{The single-target and the empty column are row-side tests, and the split is reported.}{40}{section*.57}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Reporting rules.}{40}{section*.58}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Metrics, and why the task criteria are not recall-only.}{40}{section*.59}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{E7, E8 and E9 in full.}{41}{section*.60}\protected@file@percent }
+\citation{min2019compositional}
+\citation{yen2025helmet}
+\@writefile{toc}{\contentsline {paragraph}{E7, the column ground truth.}{42}{section*.61}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The coverage residual.}{42}{section*.62}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Why these three datasets and not others.}{42}{section*.63}\protected@file@percent }
+\gdef \@abspage@last{42}

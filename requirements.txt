@@ -1,0 +1,24 @@
+# MarSea -- pinned at implementation time (spec Sec. 1.3 / D-30: transformers >= 4.53; signature asserted at import).
+# Installed and tested 2026-09-08 on CUDA 12.8 (RTX 5060 Ti / sm_120); the same pins are used on the H100 image.
+torch==2.11.0            # --index-url https://download.pytorch.org/whl/cu128
+transformers==5.16.1
+peft==0.20.0
+numpy>=2.0
+scipy
+pandas
+pyarrow
+datasets
+accelerate
+safetensors
+sentencepiece
+protobuf
+pytest
+matplotlib
+pyyaml
+tqdm
+# RULER's generator (third_party/RULER): 
+nltk
+wonderwords
+tenacity
+html2text
+beautifulsoup4

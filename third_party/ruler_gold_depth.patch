@@ -1,0 +1,106 @@
+--- a/scripts/data/synthetic/niah.py	2026-09-08 11:31:29.113713558 -0700
++++ b/scripts/data/synthetic/niah.py	2026-09-16 14:33:41.988179521 -0700
+@@ -70,6 +70,8 @@
+ parser.add_argument("--type_needle_k", type=str, default='words', help='[Options] numbers, words, uuids.')
+ parser.add_argument("--type_needle_v", type=str, default='numbers', help='[Options] numbers, words, uuids.')
+ parser.add_argument("--model_template_token", type=int, default=0, help='used for nemo skills, minus num of model template token')
++parser.add_argument("--gold_depth", type=float, default=None,
++                    help='MarSea position control (spec Sec. 13.1 [v4.1]): place the QUERIED key\'s needles at this relative depth in [0,1]; distractor needles keep RULER\'s random depths.')
+ 
+ args = parser.parse_args()
+ random.seed(args.random_seed)
+@@ -129,6 +131,7 @@
+ 
+ def generate_input_output(num_haystack):
+     keys, values, needles = [], [], []
++    needle_key_of = []
+     for _ in range(args.num_needle_k):
+         keys.append(generate_random(args.type_needle_k))
+         value = []
+@@ -139,9 +142,16 @@
+                 key=keys[-1],
+                 value=value[-1],
+             ))
++            needle_key_of.append(len(keys) - 1)
+         values.append(value)
+ 
+-    random.Random(args.random_seed).shuffle(needles)
++    perm = list(range(len(needles)))
++    random.Random(args.random_seed).shuffle(perm)
++    needles = [needles[p] for p in perm]
++    needle_key_of = [needle_key_of[p] for p in perm]
++
++    ## MarSea: the query is decided BEFORE placement so the gold needles can be positioned (--gold_depth)
++    indices = random.sample(range(args.num_needle_k), args.num_needle_q)
+ 
+     # Context
+     if args.type_haystack == 'essay':
+@@ -153,8 +163,20 @@
+             repeats = (num_haystack + len(haystack) - 1) // len(haystack)  # Ceiling division
+             text = " ".join((haystack * repeats)[:num_haystack])
+         document_sents = sent_tokenize(text.strip())
+-        insertion_positions = [0] + \
+-                              sorted([int(len(document_sents) * (depth / 100)) for depth in random.sample(DEPTHS, len(needles))]) + \
++        # MarSea: stock RULER samples depths WITHOUT replacement from 40 values and cannot place > 40 needles (E2 at m >= 8,
++        # E3 at n >= 16 with V = 4); with more needles the depths are drawn with replacement (ties insert consecutively)
++        depths = random.sample(DEPTHS, len(needles)) if len(needles) <= len(DEPTHS) else random.choices(DEPTHS, k=len(needles))
++        if args.gold_depth is not None:
++            # MarSea: the queried key's needles go to the requested depth (consecutive), distractors stay random
++            gold_pos = int(len(document_sents) * args.gold_depth)
++            gold_needles = [needles[n] for n in range(len(needles)) if needle_key_of[n] in indices]
++            other = [(int(len(document_sents) * (depths[n] / 100)), needles[n]) for n in range(len(needles)) if needle_key_of[n] not in indices]
++            placed = sorted(other + [(gold_pos, nd) for nd in gold_needles], key=lambda x: x[0])
++            needles = [nd for _, nd in placed]
++            insertion_positions = [0] + [p for p, _ in placed] + [len(document_sents)]
++        else:
++            insertion_positions = [0] + \
++                              sorted([int(len(document_sents) * (depth / 100)) for depth in depths]) + \
+                               [len(document_sents)]
+         document_sents_list = []
+         for i in range(1,len(insertion_positions)):
+@@ -182,8 +204,7 @@
+         context = "\n".join(sentences)
+ 
+ 
+-    ## Query and Answer
+-    indices = random.sample(range(args.num_needle_k), args.num_needle_q)
++    ## Query and Answer  (indices drawn above)
+     queries = [keys[i] for i in indices]
+     answers = [a for i in indices for a in values[i]]
+     query = ', '.join(queries[:-1]) + ', and ' + queries[-1] if len(queries) > 1 else queries[0]
+@@ -222,9 +243,15 @@
+         incremental = 5
+ 
+     # Estimate tokens per question to determine reasonable upper bound
+-    sample_input_text, _ = generate_input_output(incremental)
+-    sample_tokens = len(TOKENIZER.text_to_tokens(sample_input_text))
+-    tokens_per_haystack = sample_tokens / incremental
++    ## MarSea: stock RULER divides the WHOLE probe's token count by the haystack size, charging the needles'
++    # and template's FIXED cost to the per-word rate.  At 128 needles that inflates it ~5x, the 3x slack below
++    # does not absorb it, the binary search converges to its own upper bound, and a 16K request yields ~11.6K
++    # tokens -- under max_seq_length, so the assert never fires.  Two-point differencing cancels every
++    # needle- and template-sized constant exactly (measured 2026-09-16; see scripts/patch_ruler_length.py).
++    _t1 = len(TOKENIZER.text_to_tokens(generate_input_output(incremental)[0]))
++    _t2 = len(TOKENIZER.text_to_tokens(generate_input_output(2 * incremental)[0]))
++    tokens_per_haystack = max((_t2 - _t1) / incremental, 1e-6)
++    logger.info(f"MarSea rate by differencing: ({_t2} - {_t1}) / {incremental} = {tokens_per_haystack:.3f} tok/unit")
+ 
+     # Let's do 3x to allow for some slack since we can get unlucky due to sampling.
+     # NOTE: We should test this for really large sequence lengths to make sure it's reasonable.
+@@ -268,9 +295,15 @@
+                 length = len(TOKENIZER.text_to_tokens(input_text)) + tokens_to_generate
+                 assert length <= max_seq_length, f"{length} exceeds max_seq_length."
+                 break
+-            except:
++            except Exception as _e:
++                ## MarSea-patch-v3: stock RULER retries the SAME failing call forever once `used_haystack`
++                # has bottomed out at `incremental` -- the needles alone do not fit and no haystack size helps.
+                 if used_haystack > incremental:
+                     used_haystack -= incremental
++                else:
++                    raise RuntimeError(
++                        f'niah.py cannot fit {args.num_needle_k * args.num_needle_v} needles in '
++                        f'max_seq_length={max_seq_length} even at the minimum haystack ({incremental}): {_e}')
+ 
+         if args.remove_newline_tab:
+             input_text = ' '.join(input_text.replace('\n', ' ').replace('\t', ' ').strip().split())
