@@ -54,7 +54,12 @@ def main():
         det = json.load(open(args.detector)) if pathlib.Path(args.detector).exists() else None
         layers = det["patched_layers"] if det else cfg.patched_layers
         l_star, h_star = (det["l_star"], det["h_star"]) if det else (layers[0], 0)
-        exs = [build_example(r, tok) for f in args.eval_ruler for r in load_jsonl(f)]
+        # a QUOTED glob reaches us unexpanded (run_s2.sh passes $EVAL unquoted, a hand-typed S1 command quoted it and died
+        # with FileNotFoundError on the literal pattern -- pod 1, 2026-09-18); expand here as --ruler_train already does
+        eval_files = [f for pat in args.eval_ruler for f in (sorted(glob.glob(pat)) if glob.has_magic(pat) else [pat])]
+        if not eval_files:
+            raise FileNotFoundError(f"--eval_ruler {args.eval_ruler} matches no file")
+        exs = [build_example(r, tok) for f in eval_files for r in load_jsonl(f)]
         quick = quick_eval_factory(exs, [], tok, l_star, h_star, args.arm)
     train(cfg, data, quick_eval=quick)
 

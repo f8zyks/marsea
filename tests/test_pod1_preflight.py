@@ -154,3 +154,11 @@ def test_the_queues_data_globs_follow_the_training_length():
     # the mixer refuses rather than truncates: the failure mode that stopped Phase A
     mix = (ROOT / "marsea/data/mix.py").read_text()
     assert "sequences are dropped, never truncated" in mix
+
+
+def test_run_train_expands_a_quoted_eval_glob():
+    """S1 on pod 1 was typed with --eval_ruler "data/ruler/QUICK_L4096_*/validation.jsonl" (quoted): the shell did not
+    expand it, run_train.py did not either, and the run died on the literal pattern before building the model."""
+    rt = (ROOT / "scripts/run_train.py").read_text()
+    assert "glob.has_magic(pat)" in rt and "matches no file" in rt
+    assert "for f in args.eval_ruler for r in load_jsonl(f)" not in rt
