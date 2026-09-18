@@ -142,3 +142,15 @@ def test_generate_returns_an_uploaded_set_without_touching_the_generator(tmp_pat
     assert R.generate(cfg, "Qwen/Qwen2.5-1.5B", tmp_path) == (d / "validation.jsonl").resolve()
     body = (ROOT / "marsea/data/ruler.py").read_text().split("def generate(")[1].split('"""')[2]   # after the docstring
     assert body.index("if target.exists() and not force:") < body.index("ensure_patched()")
+
+
+def test_the_queues_data_globs_follow_the_training_length():
+    """Pod 1: the 4K lever needs TRAIN_L4096_* beside TRAIN_L8192_*; with the length-blind default glob an 8K run would
+    silently train on a mixture of lengths, and a 4K run saw 0/27600 sequences <= L (mix.py never truncates)."""
+    s2 = (ROOT / "scripts/run_s2.sh").read_text()
+    assert 'DATA_RULER=${DATA_RULER:-"data/ruler/TRAIN_L${L}_*"}' in s2
+    assert 'EVAL=${EVAL:-"data/ruler/QUICK_L${L}_*/validation.jsonl"}' in s2
+    assert s2.index("L=${L:-8192}") < s2.index("DATA_RULER=${DATA_RULER:-"), "L must be defined before the globs use it"
+    # the mixer refuses rather than truncates: the failure mode that stopped Phase A
+    mix = (ROOT / "marsea/data/mix.py").read_text()
+    assert "sequences are dropped, never truncated" in mix

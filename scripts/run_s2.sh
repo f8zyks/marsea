@@ -47,10 +47,13 @@ UNIFORM_L=${UNIFORM_L:-$L}                         # the dense-only E9 arms' len
                                                    # preflight.sh step 4 (runs/preflight_train_dense.json); the
                                                    # "~27 GB" this comment used to quote was extrapolated from
                                                    # 2048/4096, and nothing gated it (review e982f83 B-4).
-DATA_RULER=${DATA_RULER:-"data/ruler/TRAIN_*"}
+DATA_RULER=${DATA_RULER:-"data/ruler/TRAIN_L${L}_*"}   # the pool AT THE TRAINING LENGTH.  With TRAIN_L4096_* beside
+                                                   # TRAIN_L8192_* (the 4K lever, 2026-09-18) a length-blind glob
+                                                   # trains on a mixture of lengths at 8K (the 8K sets are dropped
+                                                   # at 4K: mix.py never truncates) -- a recipe change nothing flags
 DATA_MUSIQUE=${DATA_MUSIQUE:-data/musique/musique_ans_v1.0_train.jsonl}
 HOTPOT_N=${HOTPOT_N:-20000}
-EVAL=${EVAL:-"data/ruler/QUICK_*/validation.jsonl"}
+EVAL=${EVAL:-"data/ruler/QUICK_L${L}_*/validation.jsonl"}   # the quick eval at the training length, likewise
 EXTENDED_E9=${EXTENDED_E9:-0}                      # 1 adds the paper's further field-argument ablations (S4, not D-24)
 EVAL_EVERY=${EVAL_EVERY:-250}                      # the training procedure's cadence.  500 was tried for cost (review
                                                    # e982f83 H); measured it is 3-6 % of a job, <1.5 % of the grid, and
