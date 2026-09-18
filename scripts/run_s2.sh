@@ -198,8 +198,26 @@ barrier() {
   # landed on GPUs 4-6 -- 5 / 8 / 4 / 3 instead of the 8 / 8 / 4 the grid is sized for (ops playbook review A).
   LAUNCH_I=0
 }
+# MULTI_POD=1: several pods run THIS script against ONE volume and share the job list.  us-co-1 had no 8 x H200 on
+# 2026-09-18 and a second 4-GPU pod was likelier than an 8; every arm x seed writes only its own directory, so the one
+# thing two queues must never do is launch the same job.  A job is claimed by creating runs/claims/<tag> -- mkdir is
+# atomic, the first pod wins -- and the owner's POD_ID (default: the hostname, which on RunPod is the pod's id) is
+# written inside it.  A pod re-launching its OWN claim is a resume and goes ahead; anyone else's claim is skipped and
+# does not take a GPU slot.  A pod that died leaves its claims behind: adopt them with POD_ID=<its id>, or remove
+# runs/claims/<tag> for the jobs to hand back.  Each pod reports only its own share as done.
+MULTI_POD=${MULTI_POD:-0}; POD_ID=${POD_ID:-$(hostname)}; SKIPPED_CLAIMED=()
+claim() {
+  [ "$MULTI_POD" = "1" ] || return 0
+  mkdir -p runs/claims
+  if mkdir "runs/claims/$1" 2>/dev/null; then echo "$POD_ID" > "runs/claims/$1/owner"; return 0; fi
+  [ "$(cat "runs/claims/$1/owner" 2>/dev/null)" = "$POD_ID" ]
+}
 launch() {                                   # launch "<log tag>" <command...>: round-robins GPUs, barriers when full
   local tag="$1"; shift
+  if ! claim "$tag"; then
+    echo "[claimed by $(cat "runs/claims/$tag/owner" 2>/dev/null || echo another pod)] $tag -- skipped here"
+    SKIPPED_CLAIMED+=("$tag"); return 0
+  fi
   local gpu=$((LAUNCH_I % NGPU)); LAUNCH_I=$((LAUNCH_I + 1))
   echo "[gpu $gpu] $tag"
   CUDA_VISIBLE_DEVICES=$gpu "$@" > "runs/log_${tag}.txt" 2>&1 &
@@ -210,7 +228,7 @@ for s in 0 1 2; do
   launch "phaseA_seed$s" $PY scripts/run_train.py --arm B0 --seed $s $COMMON --phase_a_only
 done; barrier
 [ ${#FAILED_JOBS[@]} -eq 0 ] || { echo "Phase A had ${#FAILED_JOBS[@]} failed job(s); aborting" >&2; exit 1; }
-for s in 0 1 2; do [ -f runs/phaseA_seed$s.pt ] || { echo "Phase A seed $s missing; aborting"; exit 1; }; done
+for s in 0 1 2; do [ -f runs/phaseA_seed$s.pt ] || { echo "Phase A seed $s missing (under MULTI_POD=1: still training on the pod that claimed it -- wait for it); aborting"; exit 1; }; done
 echo "Phase A complete for seeds 0 1 2"
 # PHASE_A_ONLY=1: stop here even though a licence exists.  When S0 changes PATCHED_LAYERS the clean answer is to
 # retrain Phase A under the new layer set and re-run S0 on THOSE weights (the licence in the detector describes the
@@ -285,4 +303,10 @@ done; barrier                                # drains the dense arms too: one ro
 if [ ${#FAILED_JOBS[@]} -gt 0 ]; then
   echo "=== ${#FAILED_JOBS[@]} job(s) FAILED:" >&2; printf '  %s\n' "${FAILED_JOBS[@]}" >&2; exit 1
 fi
-echo "S2 training queue done.  Evaluation: bash scripts/run_evalsuite.sh"
+if [ "$MULTI_POD" = "1" ] && [ ${#SKIPPED_CLAIMED[@]} -gt 0 ]; then
+  echo "S2: THIS pod's share is done (POD_ID $POD_ID); ${#SKIPPED_CLAIMED[@]} job(s) belong to other pods -- the grid is complete"
+  echo "    only when every queue has printed this and  ls runs/*_seed*/final.pt runs/e9_*/*/final.pt | wc -l  says 20."
+  echo "    Evaluation (ONE pod only): bash scripts/run_evalsuite.sh"
+else
+  echo "S2 training queue done.  Evaluation: bash scripts/run_evalsuite.sh"
+fi

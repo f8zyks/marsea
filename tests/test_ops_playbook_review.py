@@ -179,3 +179,40 @@ def test_jobs_per_gpu_keeps_the_8_8_4_plan_on_four_gpus_and_is_gated_on_measured
     assert r.returncode == 0 and _waves(r.stdout) == [3, 4, 4, 4, 4, 4], _waves(r.stdout)
     r, _, _ = _sim_s2(tmp_path / "f", ngpu=4, extra_env={"JOBS_PER_GPU": "0"})
     assert r.returncode == 1 and "positive integer" in r.stderr
+
+
+def test_two_pods_share_one_job_list_without_ever_launching_a_job_twice(tmp_path):
+    """us-co-1 had no 8 x H200 on 2026-09-18: two 4-GPU pods against one volume.  MULTI_POD=1 claims each job with an
+    atomic mkdir under runs/claims; the other pod skips it without spending a GPU slot; a pod re-running its own
+    claims resumes them."""
+    r0, _, sim = _sim_s2(tmp_path, ngpu=4, extra_env={"PHASE_A_ONLY": "1"})          # builds the sim; no claims yet
+    assert r0.returncode == 3 and not (sim / "runs/claims").exists()
+    (sim / "launch.log").unlink()
+    base = dict(os.environ, PY=str(sim / "fakepy"), SIM=str(sim), REAL_PY=sys.executable, HOTPOT_N="0",
+                PYTHONPATH=str(ROOT), SKIP_DENSE_E9="0", MULTI_POD="1")
+    procs = [subprocess.Popen(["bash", str(sim / "scripts/run_s2.sh"), "4"], cwd=sim, env=dict(base, POD_ID=pid),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for pid in ("podA", "podB")]
+    outs = [p.communicate(timeout=600) for p in procs]
+    assert [p.returncode for p in procs] == [0, 0], [o[0][-600:] + o[1][-600:] for o in outs]
+    lines = (sim / "launch.log").read_text().splitlines()
+    jobs = [ln.split(" ", 1)[1] for ln in lines]
+    assert len(jobs) == 23 and len(set(jobs)) == 23, f"{len(jobs)} launches, {len(set(jobs))} distinct"   # 3 Phase A + 20
+    ran = [sum(1 for ln in o[0].splitlines() if ln.startswith("[gpu ")) for o in outs]
+    skipped = [sum(1 for ln in o[0].splitlines() if ln.startswith("[claimed by ")) for o in outs]
+    assert sum(ran) == 23 and sum(skipped) == 23 and all(r + s == 23 for r, s in zip(ran, skipped)), (ran, skipped)
+    owners = {d.name: (d / "owner").read_text().strip() for d in (sim / "runs/claims").iterdir()}
+    assert len(owners) == 23 and set(owners.values()) <= {"podA", "podB"}
+    for pid, o, n in zip(("podA", "podB"), outs, ran):
+        assert sum(1 for v in owners.values() if v == pid) == n
+        if skipped[("podA", "podB").index(pid)]:
+            assert f"THIS pod's share is done (POD_ID {pid})" in o[0]
+    # a pod that re-runs the queue resumes exactly its own claims and nothing else
+    (sim / "launch.log").unlink()
+    r = subprocess.run(["bash", str(sim / "scripts/run_s2.sh"), "4"], cwd=sim, env=dict(base, POD_ID="podA"),
+                       capture_output=True, text=True, timeout=600)
+    assert r.returncode == 0
+    again = [ln.split(" ", 1)[1] for ln in (sim / "launch.log").read_text().splitlines()]
+    assert len(again) == ran[0] == len(set(again))
+    # the default (no MULTI_POD) never touches the claims directory
+    r1, launches1, sim1 = _sim_s2(tmp_path / "solo", ngpu=4)
+    assert r1.returncode == 0 and len(launches1) == 23 and not (sim1 / "runs/claims").exists()
