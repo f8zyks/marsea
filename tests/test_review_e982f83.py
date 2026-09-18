@@ -119,14 +119,14 @@ def test_training_sources_fail_closed(tmp_path):
         build_training_sources([], str(tmp_path / "missing.jsonl"), 0, 0)
     s2 = (ROOT / "scripts/run_s2.sh").read_text()
     assert "REFUSING TO START" in s2 and "s0_licence" in s2 and "preflight_train_dense.json" in s2
-    assert "CHUNK=" not in s2
+    assert "--chunk $CHUNK" in s2.split("COMMON=")[1], "CHUNK is set but passed nowhere (e982f83 I)"
 
 
 def test_preflight_gates_the_dense_arms_and_regenerates_on_doubt():
     pf = (ROOT / "scripts/preflight.sh").read_text()
     assert '|| echo "   dense training did not fit' not in pf
     dense_train = [ln for ln in pf.split("\n$PY ") if "preflight_train_dense.json" in ln][0]
-    assert "--lengths 2048 4096 8192" in dense_train and "--gate_GB $GATE_GB" in dense_train
+    assert "--lengths 2048 4096 $L" in dense_train and "--targets $L" in dense_train and "--gate_GB $GATE_GB" in dense_train
     assert '[ "$NEED_DET" != "0" ]' in pf and "|| echo 1" in pf
     assert "--sites 2" in pf and "preflight_eval_dense.json" in pf and "check_unit_cap.py" in pf
 

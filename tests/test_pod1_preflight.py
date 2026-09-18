@@ -80,3 +80,30 @@ def test_gate_gb_is_the_cards_memory_with_headroom_not_the_h100s_literal():
     # the arithmetic the line does, on the two cards that matter
     for mib, expect in ((81559, 71), (143771, 126), (81920, 72)):
         assert int(0.9 * mib * 2**20 / 2**30) == expect
+
+
+def test_the_training_configuration_is_one_set_of_knobs_read_by_preflight_and_the_queue():
+    """Pod 1 measured the 8K recipe at 7.6 s/sequence (D-23 ceiling 1.2) and the levers at 4K; whichever is taken,
+    preflight must measure the configuration run_s2.sh runs: the same L, CHUNK and HEAD_BLOCK, and CHUNK must reach
+    the context (it was set in run_s2.sh and passed nowhere -- review e982f83 I)."""
+    from marsea.train import TrainConfig
+    assert TrainConfig().chunk == 1024
+    tr = (ROOT / "marsea/train.py").read_text()
+    assert "ctx.chunk = int(cfg.chunk)" in tr
+    rt = (ROOT / "scripts/run_train.py").read_text()
+    assert '"--chunk"' in rt and "chunk=args.chunk" in rt and "head_block=(args.head_block or None)" in rt
+    s2 = (ROOT / "scripts/run_s2.sh").read_text()
+    common = s2.split("COMMON=")[1].split("\n")[0]
+    assert "--L $L" in common and "--head_block $HEAD_BLOCK" in common and "--chunk $CHUNK" in common
+    assert "UNIFORM_L=${UNIFORM_L:-$L}" in s2, "the dense E9 arms must follow the grid's length"
+    pf = (ROOT / "scripts/preflight.sh").read_text()
+    assert "L=${L:-8192}; CHUNK=${CHUNK:-1024}; HEAD_BLOCK=${HEAD_BLOCK:-2}" in pf
+    ts = [ln for ln in pf.split("\n$PY ") if "time_step.py" in ln and "--mode chunked" in ln][0]
+    assert "--L $L" in ts and "--chunk $CHUNK" in ts and "--head_block $HEAD_BLOCK" in ts
+    tp = [ln for ln in pf.split("\n$PY ") if "preflight_train_chunked.json" in ln][0]
+    assert "--lengths 2048 4096 $L" in tp and "--targets $L" in tp and "--chunk $CHUNK" in tp
+    # the evaluation probes are NOT retargeted: evaluation runs at 8K and 16K whatever the training length
+    ev = [ln for ln in pf.split("\n$PY ") if "preflight_eval_chunked.json" in ln][0]
+    assert "--lengths 4096 8192 16384" in ev and "--targets 8192 16384" in ev
+    pm = (ROOT / "scripts/profile_memory.py").read_text()
+    assert "for T in sorted(set(args.lengths))" in pm

@@ -53,6 +53,8 @@ class TrainConfig:
     arm_kwargs: dict = field(default_factory=dict)       # MarSeaNormalizer / MESH knobs (E9)
     head_block: Optional[int] = None            # Q-heads processed at a time (memory / H_block; identical numbers)
     mode: str = "dense"                        # "chunked" for 16K
+    chunk: int = 1024                          # the chunked path's key-chunk width (MarSeaContext.chunk; pod 1 measured
+                                               # 2048 with head_block None 17 % faster than 1024 with head_block 2 at 8K)
     checkpoint_layers: str = "patched"         # "patched" | "all"
     device: str = "cuda"
     dry_run_steps: Optional[int] = None        # for smoke tests: stop Phase B after this many steps (NEVER Phase A)
@@ -118,6 +120,7 @@ def build_model(cfg: TrainConfig, phase_a: bool):
     cfg.patched_layers = [int(l) for l in layers]
     torch.manual_seed(cfg.seed * 7 + 1)
     ctx = MarSeaContext(mode=cfg.mode)
+    ctx.chunk = int(cfg.chunk)                 # was MarSeaContext's default 1024 whatever the queue asked (review e982f83 I)
     if phase_a and not cfg.phase_a_patched:
         # Phase A on the UNPATCHED model: the layers are not swapped at all and stock SDPA runs.  No relation either
         # way (ctx.phase_a routes a patched layer to SoftmaxNorm); this only chooses the kernel -- phase_a_kernel_check

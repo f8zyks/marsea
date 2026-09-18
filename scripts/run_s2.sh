@@ -36,9 +36,12 @@ PY=${PY:-.venv/bin/python}
 # NGPU = 0 or a non-integer made `LAUNCH_I % NGPU` a division by zero / the slot loop a no-sleep busy wait (review 9bacef9 E)
 [[ "$NGPU" =~ ^[1-9][0-9]*$ ]] || { echo "run_s2.sh: NGPU must be a positive integer (got '$NGPU')" >&2; exit 1; }
 L=${L:-8192}; STEPS=${STEPS:-2500}                 # reduced programme (D-24): Phase A 500 + Phase B 2000
-MODE=${MODE:-chunked}; HEAD_BLOCK=${HEAD_BLOCK:-2}     # (CHUNK was set here and passed nowhere: run_train has no
-                                                   # --chunk, MarSeaContext.chunk's 1024 is what runs -- review e982f83 I)
-UNIFORM_L=${UNIFORM_L:-8192}                       # the dense-only E9 arms' length: the SAME as every other
+MODE=${MODE:-chunked}; HEAD_BLOCK=${HEAD_BLOCK:-2}     # HEAD_BLOCK=0: every Q-head at once (no blocking)
+CHUNK=${CHUNK:-1024}                               # the chunked path's key-chunk width.  It used to be set here and
+                                                   # passed nowhere (review e982f83 I); run_train has --chunk now.
+                                                   # Pod 1 (H200, 8K): HEAD_BLOCK=0 CHUNK=2048 is 17 % faster than
+                                                   # 2 / 1024 at 72 GB rather than 56 GB peak -- same numbers.
+UNIFORM_L=${UNIFORM_L:-$L}                         # the dense-only E9 arms' length: the SAME as every other
                                                    # arm, so they are comparable and the eval queue's 8K sets match.
                                                    # Whether dense 8K training FITS is measured and gated by
                                                    # preflight.sh step 4 (runs/preflight_train_dense.json); the
@@ -55,7 +58,7 @@ EVAL_EVERY=${EVAL_EVERY:-250}                      # the training procedure's ca
 # S0 may change PATCHED_LAYERS after Phase A is saved; train.py then refuses to fork it (review e16a843 J).  Either
 # delete runs/phaseA_seed*.pt and re-run (Phase A retrains, ~6 GPU-h), or set ALLOW_PHASE_A_LAYER_CHANGE=1 (recorded).
 PA_FLAG=""; [ "${ALLOW_PHASE_A_LAYER_CHANGE:-0}" = "1" ] && PA_FLAG="--allow_phase_a_layer_change"
-COMMON="$PA_FLAG --L $L --total_steps $STEPS --mode $MODE --head_block $HEAD_BLOCK --detector runs/detector.json \
+COMMON="$PA_FLAG --L $L --total_steps $STEPS --mode $MODE --head_block $HEAD_BLOCK --chunk $CHUNK --detector runs/detector.json \
         --ruler_train $DATA_RULER --musique $DATA_MUSIQUE --hotpot_n $HOTPOT_N --eval_ruler $EVAL --eval_every $EVAL_EVERY"
 mkdir -p runs
 

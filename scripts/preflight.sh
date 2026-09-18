@@ -12,10 +12,17 @@ PY=${PY:-.venv/bin/python}
 # visible GPU.  It was the literal 72: pod 1 (H200, 2026-09-18) measured the two-model paired evaluation at 86 GB at 16K,
 # a pass on the card it ran on and a failure against the H100's ceiling, and the eval queue would have refused the dense
 # arms' paired jobs on a number that fits with 55 GB to spare.  Override with GATE_GB=<n> only to be STRICTER.
+# L / CHUNK / HEAD_BLOCK: the TRAINING configuration the queue will run (run_s2.sh reads the same variables), so the
+# training memory probes and the step time measure it and not a default.  Pod 1 (H200, 2026-09-18) measured the 8K
+# recipe at 7.6 s/sequence -- 6x the D-23 ceiling and Phase B at 67 h per arm -- and the 4K fallback at 1.0-1.7 s.
+# The evaluation probes stay at the evaluation lengths (8K and 16K) and MarSeaContext's default chunk: run_eval has
+# no --chunk.
+L=${L:-8192}; CHUNK=${CHUNK:-1024}; HEAD_BLOCK=${HEAD_BLOCK:-2}
 GATE_GB=${GATE_GB:-$($PY -c "import torch; print(int(0.9 * min(torch.cuda.get_device_properties(i).total_memory for i in range(torch.cuda.device_count())) / 2**30))")}
 mkdir -p runs
 echo "=============================== 1. environment and contract"
 echo "GATE_GB=$GATE_GB (the smallest visible GPU's memory with 10 % headroom, unless set in the environment)"
+echo "training configuration under test: L=$L CHUNK=$CHUNK HEAD_BLOCK=$HEAD_BLOCK (run_s2.sh reads the same variables)"
 $PY - <<'PYEOF'
 import torch, transformers, peft, marsea
 from marsea.backbone import assert_transformers_contract
@@ -40,8 +47,8 @@ echo "--- training, chunked, 2 and 4 patched layers (differenced: the MARGINAL p
 # --targets 8192 only: NOTHING trains at 16K (E3 is evaluation-only), and gating a legitimate 8K training
 # configuration on an extrapolated 16K TRAINING peak no job incurs would block the queue for nothing
 # (review 30372ae D).  The 16K figure that matters is the evaluation one, measured in the third profile below.
-$PY scripts/profile_memory.py --lengths 2048 4096 8192 --layers 2 4 --mode_impl chunked --modes train --chunk 1024 \
-    --head_block ${HEAD_BLOCK:-2} --targets 8192 --gate_GB $GATE_GB --out runs/preflight_train_chunked.json
+$PY scripts/profile_memory.py --lengths 2048 4096 $L --layers 2 4 --mode_impl chunked --modes train --chunk $CHUNK \
+    --head_block $HEAD_BLOCK --targets $L --gate_GB $GATE_GB --out runs/preflight_train_chunked.json
 echo "--- training, DENSE, 4 patched layers, MEASURED at 8K and gated"
 # This was "NOT a gate", falling through to "the queue uses --mode chunked anyway" -- but run_s2.sh trains three E9
 # arms dense at 8K, one of them the pre-registered uniform-quota ablation, and quoted an extrapolated ~27 GB for it.
@@ -50,8 +57,8 @@ echo "--- training, DENSE, 4 patched layers, MEASURED at 8K and gated"
 # measurement, the step time and the detector -- the most likely gate failure taking three unrelated gates with it
 # (review e16a843 F-1).  The verdict is enforced by run_s2.sh at startup.  Any OTHER failure (a crash) stays fatal.
 DENSE_TRAIN_NOTE=""
-$PY scripts/profile_memory.py --lengths 2048 4096 8192 --layers 4 --mode_impl dense --modes train \
-    --head_block ${HEAD_BLOCK:-2} --targets 8192 --gate_GB $GATE_GB --out runs/preflight_train_dense.json || {
+$PY scripts/profile_memory.py --lengths 2048 4096 $L --layers 4 --mode_impl dense --modes train \
+    --head_block $HEAD_BLOCK --targets $L --gate_GB $GATE_GB --out runs/preflight_train_dense.json || {
   rc=$?; [ $rc -eq 3 ] || exit $rc
   DENSE_TRAIN_NOTE="dense 8K training did NOT pass the memory gate (runs/preflight_train_dense.json): run_s2.sh will refuse to start unless SKIP_DENSE_E9=1, which drops the uniform-quota and K_ret E9 arms"
   echo "   NOTE: $DENSE_TRAIN_NOTE"
@@ -98,14 +105,14 @@ echo "=============================== 4b. the unit cap on THIS device: kernel ro
 $PY scripts/check_unit_cap.py --lengths 2048 4096 8192 16384 --out runs/unit_cap_device.json
 
 echo "=============================== 5. step time (spec Sec. 18: > 1.2 s/sequence at 8K => 2 patched layers or 4K)"
-$PY scripts/time_step.py --L 8192 --layers 4 --mode chunked --head_block ${HEAD_BLOCK:-2} --steps 5 \
+$PY scripts/time_step.py --L $L --layers 4 --mode chunked --head_block $HEAD_BLOCK --chunk $CHUNK --steps 5 \
     --out runs/step_time.json
 echo "--- step time, DENSE, at 8K: the three dense E9 arms' path (recorded; the D-23 rule is stated for the chunked queue)"
 # row_masses replaced an nnz-sized reduction with an O(n_q n_k) fp64 pass and the cap's projection gained a second sweep:
 # +17 % on the dominant Stage-1 primitive on CPU, quadratic in T, and nothing timed the dense path (review 9bacef9 E).
 # Recorded, not fatal, like the dense memory probe above: it is the same configuration and may not fit at all.
 DENSE_TIME_NOTE=""
-$PY scripts/time_step.py --L 8192 --layers 4 --mode dense --head_block ${HEAD_BLOCK:-2} --steps 5 --no_gate \
+$PY scripts/time_step.py --L $L --layers 4 --mode dense --head_block $HEAD_BLOCK --steps 5 --no_gate \
     --out runs/step_time_dense.json || {
   DENSE_TIME_NOTE="the dense 8K step-time probe failed (rc $?; runs/step_time_dense.json may be absent): the dense E9 arms' throughput is unmeasured"
   echo "   NOTE: $DENSE_TIME_NOTE"

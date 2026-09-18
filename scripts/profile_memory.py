@@ -150,7 +150,7 @@ def main():
                head_block=args.head_block, sites=args.sites, paired=bool(args.paired), layer_counts=layer_counts,
                targets=list(args.targets),
                points={}, points_by_layers={})
-    for T in args.lengths:
+    for T in sorted(set(args.lengths)):                       # preflight passes "2048 4096 $L": no duplicate at L=4096
         ids = torch.randint(0, 1000, (1, T)).cuda()
         entry = {}
         for mode in args.modes:

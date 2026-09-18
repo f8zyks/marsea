@@ -451,11 +451,11 @@ def test_queue_scripts_observe_failures_and_run_every_arm():
     assert 'per_head\\":12' in s2 and "EXTENDED_E9" not in s2.split('per_head\\":12')[1].split("\n")[0], \
         "the per_head arm is still behind EXTENDED_E9"
     assert "e9_hierarchical_K64" in s2.split("DENSE_COMMON=")[1], "the K_ret arm is not in the dense group"
-    assert "UNIFORM_L:-8192" in s2, "the dense E9 arms still train at a different length from their evaluation"
+    assert "UNIFORM_L:-$L" in s2, "the dense E9 arms still train at a different length from their evaluation"
     assert "E3depth" in ev and "--stratify depth" in ev, "E3depth is still generated and never evaluated"
     assert '--tag "e6_${arm}" --out runs/eval' in ev, "E6's --out still names a file where run_e6 creates a directory"
     pf = (root / "scripts/preflight.sh").read_text()
-    assert "--modes train --chunk 1024 \\\n    --head_block ${HEAD_BLOCK:-2} --targets 8192 --gate_GB" in pf, \
+    assert "--modes train --chunk $CHUNK \\\n    --head_block $HEAD_BLOCK --targets $L --gate_GB" in pf, \
         "preflight still gates training on a 16K extrapolation nothing trains at"
     assert "detector.json.superseded" in pf, "preflight still keeps a stale detector"
     ts = (root / "scripts/time_step.py").read_text()
