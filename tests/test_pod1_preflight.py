@@ -67,3 +67,16 @@ def test_profile_memory_b5_branch_matches_b5_two_pass():
     branch = pm.split('if mode == "teacher" and sub == "b5":')[1].split("elif mode")[0]
     assert "ctx.keep_dense = True" in branch and 'fields=("E", "supp_rel")' in branch and "ctx.keep_dense = False" in branch
     assert "sites=" not in branch, "B5's pass 1 keeps every head; a sites= argument would measure something else"
+
+
+def test_gate_gb_is_the_cards_memory_with_headroom_not_the_h100s_literal():
+    """pod 1 measured the paired evaluation at 86 GB at 16K: a pass on the 143 GB H200, a failure against 72 -- the
+    80 GB card's number, hard-coded."""
+    pf = (ROOT / "scripts/preflight.sh").read_text()
+    line = [ln for ln in pf.splitlines() if ln.startswith("GATE_GB=")][0]
+    assert "GATE_GB:-72" not in line and "get_device_properties" in line and "0.9 *" in line and "min(" in line
+    assert pf.index("PY=${PY:-") < pf.index(line), "the derivation runs $PY, which must be defined first"
+    assert 'echo "GATE_GB=$GATE_GB' in pf, "the ceiling in force must be in the log"
+    # the arithmetic the line does, on the two cards that matter
+    for mib, expect in ((81559, 71), (143771, 126), (81920, 72)):
+        assert int(0.9 * mib * 2**20 / 2**30) == expect

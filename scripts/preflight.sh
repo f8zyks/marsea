@@ -8,9 +8,14 @@
 set -e
 cd "$(dirname "$0")/.."
 PY=${PY:-.venv/bin/python}
-GATE_GB=${GATE_GB:-72}                 # 80 GB with 10 % headroom
+# GATE_GB: the card's memory with 10 % headroom -- 72 on an 80 GB H100, 126 on a 143 GB H200 -- taken from the smallest
+# visible GPU.  It was the literal 72: pod 1 (H200, 2026-09-18) measured the two-model paired evaluation at 86 GB at 16K,
+# a pass on the card it ran on and a failure against the H100's ceiling, and the eval queue would have refused the dense
+# arms' paired jobs on a number that fits with 55 GB to spare.  Override with GATE_GB=<n> only to be STRICTER.
+GATE_GB=${GATE_GB:-$($PY -c "import torch; print(int(0.9 * min(torch.cuda.get_device_properties(i).total_memory for i in range(torch.cuda.device_count())) / 2**30))")}
 mkdir -p runs
 echo "=============================== 1. environment and contract"
+echo "GATE_GB=$GATE_GB (the smallest visible GPU's memory with 10 % headroom, unless set in the environment)"
 $PY - <<'PYEOF'
 import torch, transformers, peft, marsea
 from marsea.backbone import assert_transformers_contract
