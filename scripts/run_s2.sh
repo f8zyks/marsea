@@ -259,12 +259,11 @@ launch() {                                   # launch "<log tag>" <command...>: 
       echo "[shard $((idx % SHARD_N))/$SHARD_N] $tag -- not this pod's (SHARD=$SHARD)"; SKIPPED_SHARD+=("$tag"); return 0
     fi
   fi
-  if ! claim "$tag"; then
-    echo "[claimed by $(cat "runs/claims/$tag/owner" 2>/dev/null || echo another pod)] $tag -- skipped here"
-    SKIPPED_CLAIMED+=("$tag"); return 0
-  fi
+  # slot mode takes its slot FIRST and claims SECOND: claiming first made a full pod claim its next job and then sit on
+  # it for hours waiting for a slot of its own, while a pod sharing the volume had a free one
+  local slot=-1
   if [ "$LAUNCHER" = "slots" ]; then
-    local nslots=$((NGPU * JOBS_PER_GPU)) slot=-1 i
+    local nslots=$((NGPU * JOBS_PER_GPU)) i
     while :; do
       for ((i = 0; i < nslots; i++)); do
         if [ -z "${SLOT_PID[$i]:-}" ]; then slot=$i; break; fi
@@ -272,6 +271,12 @@ launch() {                                   # launch "<log tag>" <command...>: 
       [ $slot -ge 0 ] && break
       reap_one
     done
+  fi
+  if ! claim "$tag"; then
+    echo "[claimed by $(cat "runs/claims/$tag/owner" 2>/dev/null || echo another pod)] $tag -- skipped here"
+    SKIPPED_CLAIMED+=("$tag"); return 0
+  fi
+  if [ "$LAUNCHER" = "slots" ]; then
     echo "[gpu $((slot % NGPU))] $tag"
     CUDA_VISIBLE_DEVICES=$((slot % NGPU)) "$@" > "runs/log_${tag}.txt" 2>&1 &
     SLOT_PID[$slot]=$!; SLOT_TAG[$slot]="$tag"

@@ -260,3 +260,24 @@ def test_static_shards_partition_phase_b_for_pods_on_different_volumes(tmp_path)
     for bad in ("2/2", "x", "1"):
         r, _, _ = _sim_s2(tmp_path / f"bad{bad.replace('/', '_')}", ngpu=4, extra_env={"SHARD": bad})
         assert r.returncode == 1 and "SHARD must be" in r.stderr
+
+
+def test_two_pods_in_slot_mode_take_a_slot_before_they_claim(tmp_path):
+    """Pods 1 and 2 share a volume (2026-09-18): in slot mode a pod must hold a free slot BEFORE it claims, or a full
+    pod claims its next job and sits on it while the other pod idles.  Two queues, 2 + 1 GPUs, one shard of the list."""
+    r0, _, sim = _sim_s2(tmp_path, ngpu=4, extra_env={"PHASE_A_ONLY": "1"})
+    assert r0.returncode == 3
+    (sim / "launch.log").unlink()
+    base = dict(os.environ, PY=str(sim / "fakepy"), SIM=str(sim), REAL_PY=sys.executable, HOTPOT_N="0",
+                PYTHONPATH=str(ROOT), SKIP_DENSE_E9="0", MULTI_POD="1", LAUNCHER="slots", SHARD="0/2")
+    procs = [subprocess.Popen(["bash", str(sim / "scripts/run_s2.sh"), n], cwd=sim, env=dict(base, POD_ID=pid),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for pid, n in (("big", "2"), ("small", "1"))]
+    outs = [p.communicate(timeout=600) for p in procs]
+    assert [p.returncode for p in procs] == [0, 0], [o[0][-500:] + o[1][-500:] for o in outs]
+    jobs = [ln.split(" ", 1)[1] for ln in (sim / "launch.log").read_text().splitlines()]
+    phase_b = [j for j in jobs if "--phase_a_only" not in j]
+    assert len(phase_b) == 10 and len(set(phase_b)) == 10, (len(phase_b), len(set(phase_b)))      # shard 0 of 20, once each
+    ran = [sum(1 for ln in o[0].splitlines() if ln.startswith("[gpu ") and "phaseA" not in ln) for o in outs]
+    assert sum(ran) == 10 and min(ran) >= 1, ran          # the one-GPU pod is not starved by the other's early claims
+    src = (ROOT / "scripts/run_s2.sh").read_text().split("launch() {")[1]
+    assert src.index("reap_one") < src.index('if ! claim "$tag"'), "slot mode must acquire its slot before claiming"
