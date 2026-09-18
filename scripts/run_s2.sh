@@ -178,6 +178,16 @@ done; barrier
 [ ${#FAILED_JOBS[@]} -eq 0 ] || { echo "Phase A had ${#FAILED_JOBS[@]} failed job(s); aborting" >&2; exit 1; }
 for s in 0 1 2; do [ -f runs/phaseA_seed$s.pt ] || { echo "Phase A seed $s missing; aborting"; exit 1; }; done
 echo "Phase A complete for seeds 0 1 2"
+# PHASE_A_ONLY=1: stop here even though a licence exists.  When S0 changes PATCHED_LAYERS the clean answer is to
+# retrain Phase A under the new layer set and re-run S0 on THOSE weights (the licence in the detector describes the
+# old ones) -- but with a licence already present this script used to run straight on into Phase B, so the documented
+# order "Phase A -> S0 -> grid" could not be followed a second time (pod 1, 2026-09-18: [14,19,22,23] -> [14,19,23,24]).
+if [ "${PHASE_A_ONLY:-0}" = "1" ]; then
+  echo "=== STOP: PHASE_A_ONLY=1.  Phase A is done; re-run S0 on these weights, then the grid:" >&2
+  echo "      bash scripts/run_s0.sh" >&2
+  echo "      bash scripts/run_s2.sh $NGPU" >&2
+  exit 3
+fi
 
 # ---------------------------------------------------------------- S0: the gate on everything (spec Sec. 14)
 # run_s0.sh needs the Phase-A file, which only this script produces -- so following the documented order used to exit 1

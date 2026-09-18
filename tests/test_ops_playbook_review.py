@@ -17,7 +17,7 @@ exit 0
 '''
 
 
-def _sim_s2(tmp_path, ngpu=8, skip_dense=False):
+def _sim_s2(tmp_path, ngpu=8, skip_dense=False, extra_env=None):
     """run the real run_s2.sh past its gates with every trainer replaced by a recorder of CUDA_VISIBLE_DEVICES."""
     if shutil.which("flock") is None:
         pytest.skip("flock not available")
@@ -33,7 +33,7 @@ def _sim_s2(tmp_path, ngpu=8, skip_dense=False):
     (sim / "data/musique").mkdir(); (sim / "data/musique/musique_ans_v1.0_train.jsonl").write_text("{}\n")
     fake = sim / "fakepy"; fake.write_text(FAKE_PY); fake.chmod(0o755)
     env = dict(os.environ, PY=str(fake), SIM=str(sim), REAL_PY=sys.executable, HOTPOT_N="0", PYTHONPATH=str(ROOT),
-               SKIP_DENSE_E9=("1" if skip_dense else "0"))
+               SKIP_DENSE_E9=("1" if skip_dense else "0"), **(extra_env or {}))
     r = subprocess.run(["bash", str(sim / "scripts/run_s2.sh"), str(ngpu)], cwd=sim, env=env, capture_output=True, text=True, timeout=600)
     launches = [ln.split(" ", 1) for ln in (sim / "launch.log").read_text().splitlines()] if (sim / "launch.log").exists() else []
     return r, launches, sim
@@ -133,3 +133,15 @@ def test_runs_directory_is_output_and_the_gate_4b_runbook_is_in_the_tracked_tree
     assert (ROOT / "RUNBOOK_nebius.md").exists(), "RUNBOOK_nebius.md must be in the tracked tree (the pod has no documents/)"
     rb = (ROOT / "RUNBOOK_nebius.md").read_text()
     assert "MARSEA_TOL_CAP" in rb and "If this gate fails" in rb
+
+
+def test_phase_a_only_stops_before_phase_b_even_with_a_licence(tmp_path):
+    """Pod 1, 2026-09-18: S0 changed PATCHED_LAYERS ([14,19,22,23] -> [14,19,23,24]).  Retraining Phase A and re-running
+    S0 on the new weights needs the queue to stop after Phase A, and with a licence already in the detector it ran
+    straight into Phase B."""
+    r, launches, sim = _sim_s2(tmp_path, extra_env={"PHASE_A_ONLY": "1"})
+    assert r.returncode == 3, r.stdout[-800:] + r.stderr[-800:]
+    assert "PHASE_A_ONLY=1" in r.stderr and "run_s0.sh" in r.stderr
+    assert len(launches) == 3 and all("--phase_a_only" in l[1] for l in launches), launches
+    r2, launches2, _ = _sim_s2(tmp_path / "b")                       # the default is unchanged: Phase B runs
+    assert r2.returncode == 0 and any("--phase_a_only" not in l[1] for l in launches2)
