@@ -18,11 +18,17 @@ PY=${PY:-.venv/bin/python}
 # The evaluation probes stay at the evaluation lengths (8K and 16K) and MarSeaContext's default chunk: run_eval has
 # no --chunk.
 L=${L:-8192}; CHUNK=${CHUNK:-1024}; HEAD_BLOCK=${HEAD_BLOCK:-2}
+# EVAL_HEAD_BLOCK: the EVALUATION queue's head blocking (run_evalsuite.sh reads the same variable), separate from the
+# training knob.  Pod 1 run 3: with HEAD_BLOCK=0 exported for training, the eval probes ran unblocked and the sites-only
+# pass ran out of memory at 16K (extrapolated 130 GB) where head_block 2 had measured 54 GB -- and run_evalsuite.sh,
+# reading the same HEAD_BLOCK, would have done the same to every 16K job.
+EVAL_HEAD_BLOCK=${EVAL_HEAD_BLOCK:-2}
 GATE_GB=${GATE_GB:-$($PY -c "import torch; print(int(0.9 * min(torch.cuda.get_device_properties(i).total_memory for i in range(torch.cuda.device_count())) / 2**30))")}
 mkdir -p runs
 echo "=============================== 1. environment and contract"
 echo "GATE_GB=$GATE_GB (the smallest visible GPU's memory with 10 % headroom, unless set in the environment)"
 echo "training configuration under test: L=$L CHUNK=$CHUNK HEAD_BLOCK=$HEAD_BLOCK (run_s2.sh reads the same variables)"
+echo "evaluation configuration under test: EVAL_HEAD_BLOCK=$EVAL_HEAD_BLOCK, 8K and 16K, chunk 1024 (run_evalsuite.sh reads EVAL_HEAD_BLOCK)"
 $PY - <<'PYEOF'
 import torch, transformers, peft, marsea
 from marsea.backbone import assert_transformers_contract
@@ -72,14 +78,14 @@ echo "--- teacher-forced evaluation, chunked, 4 patched layers, at 8K and 16K, w
 # stopped preflight -- and the cap proof, the step time and the detector behind it -- for a configuration the queue
 # never uses.  The one all-heads pass the queue DOES run is B5's, gated in the dense probe below.
 $PY scripts/profile_memory.py --lengths 4096 8192 16384 --layers 4 --mode_impl chunked --modes teacher --chunk 1024 \
-    --head_block ${HEAD_BLOCK:-2} --sites 2 --targets 8192 16384 --gate_GB $GATE_GB --gate_keys teacher_head \
+    --head_block $EVAL_HEAD_BLOCK --sites 2 --targets 8192 16384 --gate_GB $GATE_GB --gate_keys teacher_head \
     --out runs/preflight_eval_chunked.json
 echo "--- teacher-forced evaluation, DENSE, 4 patched layers, at 8K (five of the seven eval job types run dense; B5's pass 1 too)"
 # gated on what the eval queue runs -- the measurement heads kept (teacher_head), plus B5's pass 1 (teacher_b5: every
 # head of every patched layer with ctx.keep_dense on, fields E and supp_rel), which runs dense at 8K on E2 and was
 # measured by no probe before (the `teacher` key keeps l*'s heads with every field: neither B5 nor anything else)
 $PY scripts/profile_memory.py --lengths 4096 8192 --layers 4 --mode_impl dense --modes teacher --b5 \
-    --head_block ${HEAD_BLOCK:-2} --sites 2 --targets 8192 --gate_GB $GATE_GB --gate_keys teacher_head teacher_b5 \
+    --head_block $EVAL_HEAD_BLOCK --sites 2 --targets 8192 --gate_GB $GATE_GB --gate_keys teacher_head teacher_b5 \
     --out runs/preflight_eval_dense.json
 echo "--- teacher-forced evaluation of a DENSE arm on MarSea's paired relation, at 8K and 16K: TWO models resident"
 # B0/B1/B2/B4 on E2..E5 -- most of the eval queue -- keep the paired MarSea model loaded for the whole job and run its
@@ -88,7 +94,7 @@ echo "--- teacher-forced evaluation of a DENSE arm on MarSea's paired relation, 
 # cap-binding proof, the step time and the detector behind it; run_evalsuite.sh reads the verdict (review 7814665 F-3).
 PAIRED_NOTE=""
 $PY scripts/profile_memory.py --arm B0 --paired --lengths 4096 8192 16384 --layers 4 --mode_impl chunked --modes teacher \
-    --chunk 1024 --head_block ${HEAD_BLOCK:-2} --sites 2 --targets 8192 16384 --gate_GB $GATE_GB --gate_keys teacher_head \
+    --chunk 1024 --head_block $EVAL_HEAD_BLOCK --sites 2 --targets 8192 16384 --gate_GB $GATE_GB --gate_keys teacher_head \
     --out runs/preflight_eval_paired.json || {
   rc=$?; [ $rc -eq 3 ] || exit $rc
   PAIRED_NOTE="the two-model paired evaluation did NOT pass the memory gate (runs/preflight_eval_paired.json): run_evalsuite.sh will refuse the dense arms' --paired_marsea_ckpt jobs unless SKIP_PAIRED_GATE=1"
