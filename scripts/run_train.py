@@ -24,6 +24,9 @@ def main():
     ap.add_argument("--allow_phase_a_layer_change", action="store_true",
                     help="fork a Phase-A checkpoint whose patched layers differ from the detector's (S0 changed them); recorded")
     ap.add_argument("--head_block", type=int, default=None, help="Q-heads processed at a time in the patched layers (memory; identical numbers); 0 = all")
+    ap.add_argument("--init_gap_policy", default="stop", choices=["stop", "record"],
+                    help="Phase-B init sanity 5(b) over its 5 %% bound: stop (the procedure) or record -- ONLY after the owner has "
+                         "inspected the stop and decided to continue; the decision is written into the run README")
     ap.add_argument("--chunk", type=int, default=1024, help="the chunked path's key-chunk width (MarSeaContext.chunk)")
     ap.add_argument("--log_every", type=int, default=50, help="steps between E8 blocks / log lines")
     ap.add_argument("--eval_every", type=int, default=250); ap.add_argument("--ckpt_every", type=int, default=250)
@@ -45,7 +48,7 @@ def main():
                       phase_a_steps=args.phase_a_steps, accum=args.accum, out_dir=args.out, mode=args.mode,
                       detector_json=args.detector if pathlib.Path(args.detector).exists() else None,
                       dry_run_steps=args.dry_run_steps, arm_kwargs=json.loads(args.arm_kwargs), checkpoint_layers=args.checkpoint_layers,
-                      head_block=(args.head_block or None), chunk=args.chunk, log_every=args.log_every, eval_every=args.eval_every, ckpt_every=args.ckpt_every,
+                      head_block=(args.head_block or None), chunk=args.chunk, init_gap_policy=args.init_gap_policy, log_every=args.log_every, eval_every=args.eval_every, ckpt_every=args.ckpt_every,
                       phase_a_patched=not args.phase_a_unpatched, phase_a_ckpt=args.phase_a_ckpt, phase_a_only=args.phase_a_only,
                       allow_phase_a_layer_change=args.allow_phase_a_layer_change)
     if args.layers: cfg.patched_layers = args.layers; cfg.detector_json = None

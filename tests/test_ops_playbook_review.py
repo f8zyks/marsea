@@ -281,3 +281,48 @@ def test_two_pods_in_slot_mode_take_a_slot_before_they_claim(tmp_path):
     assert sum(ran) == 10 and min(ran) >= 1, ran          # the one-GPU pod is not starved by the other's early claims
     src = (ROOT / "scripts/run_s2.sh").read_text().split("launch() {")[1]
     assert src.index("reap_one") < src.index('if ! claim "$tag"'), "slot mode must acquire its slot before claiming"
+
+
+def test_only_gpus_and_the_job_lock(tmp_path):
+    """Restarting stopped jobs beside live ones (2026-09-18: four jobs stopped at init sanity 5(b) while six trained):
+    ONLY launches just the named tags, GPUS places them, and a job whose lock a live trainer holds is never relaunched."""
+    import fcntl
+    tags = "--armmarsea--seed2 e9_uniform_quota"
+    r, launches, sim = _sim_s2(tmp_path / "a", ngpu=4, extra_env={"ONLY": tags, "GPUS": "0 3", "LAUNCHER": "slots",
+                                                                  "INIT_GAP_POLICY": "record"})
+    assert r.returncode == 0, r.stdout[-800:] + r.stderr[-800:]
+    assert len(launches) == 2 and {l[0] for l in launches} <= {"0", "3"}, launches
+    assert all("--init_gap_policy record" in l[1] for l in launches)
+    assert any("quota_mode" in l[1] for l in launches) and any("--arm marsea --seed 2" in l[1] for l in launches)
+    # the default policy is the procedure's, on every job of an ordinary run
+    r, launches, sim = _sim_s2(tmp_path / "b", ngpu=4)
+    assert len(launches) == 23 and all("--init_gap_policy stop" in l[1] for l in launches)
+    # a held lock: the job is skipped, everything else runs
+    (sim / "launch.log").unlink()
+    held = open(sim / "runs/locks/--armB2--seed1.lock", "w"); fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    env = dict(os.environ, PY=str(sim / "fakepy"), SIM=str(sim), REAL_PY=sys.executable, HOTPOT_N="0", PYTHONPATH=str(ROOT), SKIP_DENSE_E9="0")
+    r = subprocess.run(["bash", str(sim / "scripts/run_s2.sh"), "4"], cwd=sim, env=env, capture_output=True, text=True, timeout=600)
+    held.close()
+    assert r.returncode == 0 and "[running] --armB2--seed1" in r.stdout
+    again = [ln.split(" ", 1)[1] for ln in (sim / "launch.log").read_text().splitlines()]
+    assert len(again) == 22 and not any("--arm B2 --seed 1" in j for j in again)
+    for bad in ({"INIT_GAP_POLICY": "ignore"}, {"GPUS": "0 x"}):
+        r, _, _ = _sim_s2(tmp_path / ("bad" + "".join(bad)), ngpu=4, extra_env=bad)
+        assert r.returncode == 1
+
+
+def test_init_gap_verdict_is_the_procedure_unless_the_owner_recorded_a_decision():
+    from marsea.train import init_gap_verdict, INIT_GAP_BOUND, TrainConfig
+    assert INIT_GAP_BOUND == 0.05 and TrainConfig().init_gap_policy == "stop"
+    ok = dict(finite=True, rel_gap_5b=0.0478, signed_rel_gap_5b=-0.0478)
+    over = dict(finite=True, rel_gap_5b=0.0523, signed_rel_gap_5b=-0.0523)        # seed 2, 2026-09-18
+    assert init_gap_verdict(ok) == "ok" and init_gap_verdict(ok, "record") == "ok"
+    with pytest.raises(RuntimeError, match="STOP and inspect"):
+        init_gap_verdict(over)
+    assert init_gap_verdict(over, "record") == "recorded"
+    with pytest.raises(RuntimeError, match="non-finite"):
+        init_gap_verdict(dict(finite=False, rel_gap_5b=0.0, signed_rel_gap_5b=0.0), "record")
+    with pytest.raises(ValueError):
+        init_gap_verdict(ok, "ignore")
+    src = (ROOT / "marsea/train.py").read_text()
+    assert "continued by the owner's decision" in src and "signed_rel_gap_5b" in src

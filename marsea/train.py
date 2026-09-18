@@ -53,6 +53,8 @@ class TrainConfig:
     arm_kwargs: dict = field(default_factory=dict)       # MarSeaNormalizer / MESH knobs (E9)
     head_block: Optional[int] = None            # Q-heads processed at a time (memory / H_block; identical numbers)
     mode: str = "dense"                        # "chunked" for 16K
+    init_gap_policy: str = "stop"              # Phase-B init sanity 5(b): "stop" (the procedure) | "record" (the OWNER has
+                                               # inspected the stop and decided to continue; written into the README)
     chunk: int = 1024                          # the chunked path's key-chunk width (MarSeaContext.chunk; pod 1 measured
                                                # 2048 with head_block None 17 % faster than 1024 with head_block 2 at 8K)
     checkpoint_layers: str = "patched"         # "patched" | "all"
@@ -269,6 +271,26 @@ def load_checkpoint(path, model, opt=None):
 
 
 # --------------------------------------------------------------------------- Phase-B initialisation (Sec. 6)
+INIT_GAP_BOUND = 0.05
+
+
+def init_gap_verdict(sanity: dict, policy: str = "stop") -> str:
+    """Phase-B init sanity 5(b).  A non-finite live loss always raises.  A gap over the bound raises under "stop" -- the
+    procedure: "STOP and inspect, do not train through it" -- and returns "recorded" under "record", which exists for one
+    case only: the owner HAS inspected the stop and decided to continue, and the run README says so.  On the first real
+    grid (2026-09-18) the bound stopped seed 2 of MarSea and B3 at 5.2 % (seeds 0 and 1: 4.8 %, 1.5 %; every gap
+    negative), the key-only ablation at -12.9 % and the uniform-quota ablation at +50.6 %."""
+    if policy not in ("stop", "record"):
+        raise ValueError(f"init_gap_policy must be 'stop' or 'record', got {policy!r}")
+    if not sanity["finite"]:
+        raise RuntimeError(f"Phase-B init sanity 5(b) failed: non-finite live loss: {sanity}")
+    if sanity["rel_gap_5b"] <= INIT_GAP_BOUND:
+        return "ok"
+    if policy == "stop":
+        raise RuntimeError(f"Phase-B init sanity 5(b) failed: {sanity} -- STOP and inspect, do not train through it")
+    return "recorded"
+
+
 @torch.no_grad()
 def phase_b_init(model, ctx: MarSeaContext, data, cursor: int, cfg: TrainConfig, readme: dict):
     """calibrate b0 (bisection to rho0) and TauK's bias (median 1/std) per patched layer on `calib_sequences`
@@ -338,14 +360,19 @@ def phase_b_init(model, ctx: MarSeaContext, data, cursor: int, cfg: TrainConfig,
     ctx.collect = False
     sanity = dict(loss_phaseA=loss_pa, loss_forced_empty=loss_a, gap_5a=abs(loss_a - loss_pa),
                   loss_live=loss_live, rel_gap_5b=abs(loss_live - loss_a) / max(1e-8, abs(loss_a)),
+                  signed_rel_gap_5b=(loss_live - loss_a) / max(1e-8, abs(loss_a)),     # negative: the live relation LOWERS the loss
                   finite=math.isfinite(loss_live), coverage_live={l: float(np.mean(v)) if v else None for l, v in cov.items()})
     readme["phase_b_init"] = dict(calibration=calib, sanity=sanity)
     print(f"[phase B init] calibration {json.dumps(calib)}\n[phase B init] sanity {json.dumps(sanity)}")
     ctx.mode = mode_saved
     if sanity["gap_5a"] > 1e-4 * max(1.0, abs(loss_pa)):                     # 5(a): E forced empty == Phase A's path (INV-9 at model level)
         raise RuntimeError(f"Phase-B init sanity 5(a) failed: forced-empty loss {loss_a} vs Phase-A path {loss_pa}")
-    if not sanity["finite"] or sanity["rel_gap_5b"] > 0.05:                   # 5(b): live within 5 %, no NaN
-        raise RuntimeError(f"Phase-B init sanity 5(b) failed: {sanity} -- STOP and inspect, do not train through it")
+    verdict = init_gap_verdict(sanity, cfg.init_gap_policy)                  # 5(b): live within 5 %, no NaN
+    if verdict == "recorded":
+        ev = dict(step=cfg.phase_a_steps, event="init sanity 5(b) exceeded; continued by the owner's decision (init_gap_policy=record)",
+                  rel_gap_5b=sanity["rel_gap_5b"], signed_rel_gap_5b=sanity["signed_rel_gap_5b"], bound=INIT_GAP_BOUND)
+        readme.setdefault("events", []).append(ev)
+        print(f"[phase B init] 5(b) EXCEEDED ({sanity['signed_rel_gap_5b']:+.4f} against +-{INIT_GAP_BOUND}); continuing: init_gap_policy=record")
     model.train()
     return sanity
 

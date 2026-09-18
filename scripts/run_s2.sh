@@ -61,7 +61,19 @@ EVAL_EVERY=${EVAL_EVERY:-250}                      # the training procedure's ca
 # S0 may change PATCHED_LAYERS after Phase A is saved; train.py then refuses to fork it (review e16a843 J).  Either
 # delete runs/phaseA_seed*.pt and re-run (Phase A retrains, ~6 GPU-h), or set ALLOW_PHASE_A_LAYER_CHANGE=1 (recorded).
 PA_FLAG=""; [ "${ALLOW_PHASE_A_LAYER_CHANGE:-0}" = "1" ] && PA_FLAG="--allow_phase_a_layer_change"
-COMMON="$PA_FLAG --L $L --total_steps $STEPS --mode $MODE --head_block $HEAD_BLOCK --chunk $CHUNK --detector runs/detector.json \
+# INIT_GAP_POLICY=record: continue past Phase-B init sanity 5(b) and write the decision into the README.  The OWNER's
+# call after inspecting a stop, never a default.  ONLY="tag tag ...": launch just these jobs (the tags the log prints),
+# e.g. to restart stopped jobs beside the ones still training.  GPUS="0 3": use these physical GPUs (NGPU = how many).
+INIT_GAP_POLICY=${INIT_GAP_POLICY:-stop}
+[[ "$INIT_GAP_POLICY" == stop || "$INIT_GAP_POLICY" == record ]] || { echo "run_s2.sh: INIT_GAP_POLICY must be stop or record" >&2; exit 1; }
+ONLY=${ONLY:-}
+GPU_LIST=(); if [ -n "${GPUS:-}" ]; then
+  read -r -a GPU_LIST <<< "$GPUS"
+  for g in "${GPU_LIST[@]}"; do [[ "$g" =~ ^[0-9]+$ ]] || { echo "run_s2.sh: GPUS must be a list of GPU indices (got '$GPUS')" >&2; exit 1; }; done
+  NGPU=${#GPU_LIST[@]}
+fi
+gpu_of() { if [ ${#GPU_LIST[@]} -gt 0 ]; then echo "${GPU_LIST[$(($1 % NGPU))]}"; else echo $(($1 % NGPU)); fi; }
+COMMON="$PA_FLAG --init_gap_policy $INIT_GAP_POLICY --L $L --total_steps $STEPS --mode $MODE --head_block $HEAD_BLOCK --chunk $CHUNK --detector runs/detector.json \
         --ruler_train $DATA_RULER --musique $DATA_MUSIQUE --hotpot_n $HOTPOT_N --eval_ruler $EVAL --eval_every $EVAL_EVERY"
 mkdir -p runs
 
@@ -251,8 +263,17 @@ claim() {
 SHARD=${SHARD:-0/1}
 [[ "$SHARD" =~ ^([0-9]+)/([1-9][0-9]*)$ ]] && (( BASH_REMATCH[1] < BASH_REMATCH[2] )) || { echo "run_s2.sh: SHARD must be k/n with 0 <= k < n (got '$SHARD')" >&2; exit 1; }
 SHARD_K=${BASH_REMATCH[1]}; SHARD_N=${BASH_REMATCH[2]}; PHASE_B_I=0; SKIPPED_SHARD=()
+# A job's LOCK: runs/locks/<tag>.lock is flock'ed by the launcher and inherited by the trainer, so it is held exactly as
+# long as the trainer lives.  A second queue run on the same volume (a restart beside live jobs, another pod adopting
+# claims) skips a job whose lock is held instead of putting a second writer into its run directory (S1 was started
+# twice on 2026-09-18: the second process RESUMED from the first one's step-500 checkpoint).
+SKIPPED_RUNNING=(); HAVE_FLOCK=0; command -v flock > /dev/null 2>&1 && HAVE_FLOCK=1
 launch() {                                   # launch "<log tag>" <command...>: round-robins GPUs, barriers when full
   local tag="$1"; shift
+  if [ -n "$ONLY" ] && [[ " $ONLY " != *" $tag "* ]]; then
+    if [[ "$tag" != phaseA_* ]]; then PHASE_B_I=$((PHASE_B_I + 1)); fi       # keep the shard index stable
+    return 0
+  fi
   if [[ "$tag" != phaseA_* ]]; then
     local idx=$PHASE_B_I; PHASE_B_I=$((PHASE_B_I + 1))
     if (( idx % SHARD_N != SHARD_K )); then
@@ -276,15 +297,25 @@ launch() {                                   # launch "<log tag>" <command...>: 
     echo "[claimed by $(cat "runs/claims/$tag/owner" 2>/dev/null || echo another pod)] $tag -- skipped here"
     SKIPPED_CLAIMED+=("$tag"); return 0
   fi
+  local lockfd=""
+  if [ $HAVE_FLOCK -eq 1 ]; then
+    mkdir -p runs/locks; exec {lockfd}> "runs/locks/$tag.lock"
+    if ! flock -n "$lockfd"; then
+      echo "[running] $tag -- its lock is held by a live trainer; skipped here"
+      exec {lockfd}>&-; SKIPPED_RUNNING+=("$tag"); return 0
+    fi
+  fi
   if [ "$LAUNCHER" = "slots" ]; then
-    echo "[gpu $((slot % NGPU))] $tag"
-    CUDA_VISIBLE_DEVICES=$((slot % NGPU)) "$@" > "runs/log_${tag}.txt" 2>&1 &
+    echo "[gpu $(gpu_of $slot)] $tag"
+    CUDA_VISIBLE_DEVICES=$(gpu_of $slot) "$@" > "runs/log_${tag}.txt" 2>&1 &
     SLOT_PID[$slot]=$!; SLOT_TAG[$slot]="$tag"
+    if [ -n "$lockfd" ]; then exec {lockfd}>&-; fi        # the trainer's inherited copy keeps the lock until it exits
     return 0
   fi
-  local gpu=$((LAUNCH_I % NGPU)); LAUNCH_I=$((LAUNCH_I + 1))
+  local gpu; gpu=$(gpu_of $LAUNCH_I); LAUNCH_I=$((LAUNCH_I + 1))
   echo "[gpu $gpu] $tag"
   CUDA_VISIBLE_DEVICES=$gpu "$@" > "runs/log_${tag}.txt" 2>&1 &
+  if [ -n "$lockfd" ]; then exec {lockfd}>&-; fi
   PIDS+=($!); PTAGS+=("$tag")
   if (( LAUNCH_I % (NGPU * JOBS_PER_GPU) == 0 )); then barrier; fi      # a wave is NGPU x JOBS_PER_GPU jobs; job i sits on GPU i % NGPU
 }
@@ -344,7 +375,7 @@ fi
 # of one -- 20 jobs in 8 / 8 / 1 / 3 on 8 GPUs.  In the same round-robin as the chunked arms it is 8 / 8 / 4, one
 # arm-duration less of wall clock (ops playbook review A).  The gate (DENSE_E9_OK) is decided at startup, so the
 # block moves cleanly; wave 1 then lasts as long as its slowest member, dense or chunked.
-DENSE_COMMON="$PA_FLAG --phase_a_ckpt runs/phaseA_seed0.pt --mode dense --L $UNIFORM_L --head_block $HEAD_BLOCK \
+DENSE_COMMON="$PA_FLAG --init_gap_policy $INIT_GAP_POLICY --phase_a_ckpt runs/phaseA_seed0.pt --mode dense --L $UNIFORM_L --head_block $HEAD_BLOCK \
         --total_steps $STEPS --detector runs/detector.json --ruler_train $DATA_RULER --musique $DATA_MUSIQUE \
         --hotpot_n $HOTPOT_N --eval_ruler $EVAL --eval_every $EVAL_EVERY"
 if [ "$DENSE_E9_OK" != "1" ]; then
