@@ -109,7 +109,10 @@ def test_the_training_configuration_is_one_set_of_knobs_read_by_preflight_and_th
         assert "--head_block $EVAL_HEAD_BLOCK" in ev and "$HEAD_BLOCK " not in ev and "--chunk $CHUNK" not in ev, name
     ev = [ln for ln in pf.split("\n$PY ") if "preflight_eval_chunked.json" in ln][0]
     assert "--lengths 4096 8192 16384" in ev and "--targets 8192 16384" in ev
-    assert "EVAL_HEAD_BLOCK=${EVAL_HEAD_BLOCK:-2}" in pf and "${HEAD_BLOCK:-2}" not in pf
+    assert "EVAL_HEAD_BLOCK=${EVAL_HEAD_BLOCK:-2}" in pf
+    # the training default is defined ONCE, at the top, and every probe reads $HEAD_BLOCK (8887dff had replaced the
+    # definition itself, so an unset HEAD_BLOCK became an empty --head_block argument)
+    assert pf.count("${HEAD_BLOCK:-2}") == 1 and "HEAD_BLOCK=${HEAD_BLOCK:-2}" in pf
     es = (ROOT / "scripts/run_evalsuite.sh").read_text()
     assert "HEAD_BLOCK=${EVAL_HEAD_BLOCK:-2}" in es and "HEAD_BLOCK=${HEAD_BLOCK:-2}" not in es
     from conftest import RUN_KNOBS
