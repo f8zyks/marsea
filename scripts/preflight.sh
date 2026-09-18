@@ -17,7 +17,7 @@ PY=${PY:-.venv/bin/python}
 # recipe at 7.6 s/sequence -- 6x the D-23 ceiling and Phase B at 67 h per arm -- and the 4K fallback at 1.0-1.7 s.
 # The evaluation probes stay at the evaluation lengths (8K and 16K) and MarSeaContext's default chunk: run_eval has
 # no --chunk.
-L=${L:-8192}; CHUNK=${CHUNK:-1024}; HEAD_BLOCK=${HEAD_BLOCK:-2}
+L=${L:-8192}; CHUNK=${CHUNK:-1024}; HEAD_BLOCK=$HEAD_BLOCK
 # EVAL_HEAD_BLOCK: the EVALUATION queue's head blocking (run_evalsuite.sh reads the same variable), separate from the
 # training knob.  Pod 1 run 3: with HEAD_BLOCK=0 exported for training, the eval probes ran unblocked and the sites-only
 # pass ran out of memory at 16K (extrapolated 130 GB) where head_block 2 had measured 54 GB -- and run_evalsuite.sh,

@@ -17,7 +17,9 @@ for d in runs/e9_*/; do
   [ -d "$d" ] || continue
   b=$(basename "$d"); [[ " $E9_ARMS " == *" $b "* ]] || E9_ARMS="$E9_ARMS $b"
 done
-HEAD_BLOCK=${HEAD_BLOCK:-2}                                # as preflight profiles it: the memory gate must be the queue's
+HEAD_BLOCK=${EVAL_HEAD_BLOCK:-2}                           # the EVALUATION head blocking, as preflight's eval probes profile it:
+                                                           # NOT the training knob HEAD_BLOCK (0 for the 4K grid; unblocked, the
+                                                           # 16K sites-only pass ran out of memory on the H200 -- pod 1 run 3)
 N16K=${N16K:-400}           # examples per 16K job, spread evenly over its configs.  n = 1000 (5 configs x 200) is ~3x
                             # the compute table's evaluation budget (review e982f83 H) and E3's paired pass was
                             # sized at ~268 GB of host RAM per process (B-3).

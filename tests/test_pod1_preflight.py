@@ -102,9 +102,18 @@ def test_the_training_configuration_is_one_set_of_knobs_read_by_preflight_and_th
     assert "--L $L" in ts and "--chunk $CHUNK" in ts and "--head_block $HEAD_BLOCK" in ts
     tp = [ln for ln in pf.split("\n$PY ") if "preflight_train_chunked.json" in ln][0]
     assert "--lengths 2048 4096 $L" in tp and "--targets $L" in tp and "--chunk $CHUNK" in tp
-    # the evaluation probes are NOT retargeted: evaluation runs at 8K and 16K whatever the training length
+    # the evaluation probes are NOT retargeted: evaluation runs at 8K and 16K whatever the training length, with ITS
+    # OWN head blocking (pod 1 run 3: unblocked, the 16K sites-only pass OOMs; run_evalsuite.sh reads EVAL_HEAD_BLOCK)
+    for name in ("preflight_eval_chunked.json", "preflight_eval_dense.json", "preflight_eval_paired.json"):
+        ev = [ln for ln in pf.split("\n$PY ") if name in ln][0]
+        assert "--head_block $EVAL_HEAD_BLOCK" in ev and "$HEAD_BLOCK " not in ev and "--chunk $CHUNK" not in ev, name
     ev = [ln for ln in pf.split("\n$PY ") if "preflight_eval_chunked.json" in ln][0]
     assert "--lengths 4096 8192 16384" in ev and "--targets 8192 16384" in ev
+    assert "EVAL_HEAD_BLOCK=${EVAL_HEAD_BLOCK:-2}" in pf and "${HEAD_BLOCK:-2}" not in pf
+    es = (ROOT / "scripts/run_evalsuite.sh").read_text()
+    assert "HEAD_BLOCK=${EVAL_HEAD_BLOCK:-2}" in es and "HEAD_BLOCK=${HEAD_BLOCK:-2}" not in es
+    from conftest import RUN_KNOBS
+    assert "EVAL_HEAD_BLOCK" in RUN_KNOBS
     pm = (ROOT / "scripts/profile_memory.py").read_text()
     assert "for T in sorted(set(args.lengths))" in pm
 
