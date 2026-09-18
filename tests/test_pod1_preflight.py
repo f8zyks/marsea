@@ -128,3 +128,17 @@ def test_the_suite_does_not_read_the_operators_run_knobs():
     from conftest import RUN_KNOBS
     for k in ("L", "CHUNK", "HEAD_BLOCK", "STEPS", "MARSEA_TOL_CAP", "GATE_GB"):
         assert k in RUN_KNOBS and k not in os.environ
+
+
+def test_generate_returns_an_uploaded_set_without_touching_the_generator(tmp_path, monkeypatch):
+    """Pod 1, preflight step 6: run_detector -> generate() called ensure_patched() before checking that the DET set
+    already existed, and the pod has no third_party/RULER by design (the data is uploaded)."""
+    import marsea.data.ruler as R
+    cfg = R.NIAHConfig("DET", 4096, 1, 1, 1, type_needle_v="words", seed=0, num_samples=200, gold_depth=None)
+    assert cfg.save_name() == "DET_L4096_K1_V1_Q1_drand_s0", cfg.save_name()   # the uploaded set's name
+    d = tmp_path / cfg.save_name(); d.mkdir(); (d / "validation.jsonl").write_text("{}\n")
+    monkeypatch.setattr(R, "NIAH", tmp_path / "no_such_dir" / "niah.py")
+    monkeypatch.setattr(R, "ensure_patched", lambda: (_ for _ in ()).throw(AssertionError("generator touched")))
+    assert R.generate(cfg, "Qwen/Qwen2.5-1.5B", tmp_path) == (d / "validation.jsonl").resolve()
+    body = (ROOT / "marsea/data/ruler.py").read_text().split("def generate(")[1].split('"""')[2]   # after the docstring
+    assert body.index("if target.exists() and not force:") < body.index("ensure_patched()")

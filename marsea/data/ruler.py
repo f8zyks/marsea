@@ -134,13 +134,17 @@ def ensure_patched():
 
 
 def generate(cfg: NIAHConfig, tokenizer_path: str, out_dir: pathlib.Path, force: bool = False, timeout: int = 3600) -> pathlib.Path:
-    """Runs RULER's niah.py; returns the jsonl path.  Idempotent."""
-    ensure_patched()
+    """Runs RULER's niah.py; returns the jsonl path.  Idempotent.
+
+    An existing set is returned BEFORE the generator is touched: the pods have the uploaded data and no
+    third_party/RULER (setup_runpod.sh clones it only when generation is needed), and ensure_patched() used to run
+    first, so preflight step 6 on pod 1 died with FileNotFoundError on niah.py with the DET set sitting in data/ruler."""
     out_dir = pathlib.Path(out_dir).resolve()               # niah.py runs with cwd = its own directory
     save_name = cfg.save_name()
     target = out_dir / save_name / "validation.jsonl"
     if target.exists() and not force:
         return target
+    ensure_patched()
     demand, avail = needle_budget(cfg)
     if demand > avail:
         raise ValueError(f"{cfg.save_name()}: {cfg.num_needle_k * cfg.num_needle_v} needle sentences plus the minimum "

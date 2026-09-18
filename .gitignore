@@ -8,8 +8,9 @@ __pycache__/
 # Cloned upstream (re-created by scripts/setup_runpod.sh); the patch we apply IS tracked
 third_party/RULER/
 
-# Generated RULER sets (scripts/gen_data.sh, ~21 MB and reproducible from the seeds)
-data/
+# Generated RULER sets (scripts/gen_data.sh, ~21 MB and reproducible from the seeds).  Anchored: the unanchored
+# `data/` also matched the PACKAGE marsea/data/, and `git add marsea/data/ruler.py` refused a tracked file
+/data/
 
 # Run outputs are OUTPUT, JSON included: S0 writes its licence into runs/detector.json, and while that file was tracked
 # every README, checkpoint and eval table from S0 on would have carried <hash>+dirty (git_hash() reads the whole tree)
