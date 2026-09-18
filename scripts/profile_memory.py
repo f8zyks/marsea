@@ -19,6 +19,57 @@ def _mem():
     return torch.cuda.max_memory_allocated() / 2**30, torch.cuda.memory_allocated() / 2**30
 
 
+def _tensor_bytes(o):
+    """bytes held by a tensor, or by every tensor inside a dict / list / tuple (extra["sparse"] is a DICT of tensors:
+    the chunked path's whole sparse store lives there)."""
+    if torch.is_tensor(o):
+        return o.element_size() * o.nelement()
+    if isinstance(o, dict):
+        return sum(_tensor_bytes(v) for v in o.values())
+    if isinstance(o, (list, tuple)):
+        return sum(_tensor_bytes(v) for v in o)
+    return 0
+
+
+def _key(mode, sub):
+    return f"{mode}_b5" if sub == "b5" else f"{mode}_head" if sub else mode
+
+
+def gate_verdict(points: dict, extrapolation: dict, targets, gate_GB: float, gate_keys=None) -> dict:
+    """The gate, over the GATED keys only: an OOM in a gated key fails it whatever the numbers say; otherwise the worst
+    measured or extrapolated peak (at `targets`, and the 4-layer column when present) must be <= gate_GB.
+
+    Keys nothing in the queue runs must not be gated: preflight's chunked evaluation probe gated `teacher` -- every
+    head of l* kept, which only B5's pass 1 does, and B5 runs dense at 8K -- at 16K, where the H200 ran out of memory
+    on a pass no job incurs while `teacher_head`, the pass the whole 16K queue runs, measured 54 GB (pod 1, 2026-09-18).
+    A gated key that has no measurement at all is a failure too (the probe never ran it)."""
+    gated = (lambda k: True) if gate_keys is None else (lambda k: k in gate_keys)
+    worst, why, oom = 0.0, None, None
+    seen = set()
+    for T, entry in points.items():
+        for k, v in entry.items():
+            if not gated(k):
+                continue
+            seen.add(k)
+            if v.get("oom"):
+                oom = oom or f"OOM at T = {T} ({k})"
+            if v.get("peak_GB", 0) > worst:
+                worst, why = v["peak_GB"], f"measured {k} at T = {T}"
+    for key, ex in extrapolation.items():
+        if not gated(key):
+            continue
+        for t in targets:
+            for kk in (str(t), f"{t}_at_4_layers"):
+                if ex.get(kk) and ex[kk] > worst:
+                    worst, why = ex[kk], f"extrapolated {key} at {kk}"
+    missing = sorted(set(gate_keys or []) - seen)
+    if missing and oom is None:
+        oom = f"gated key(s) never measured: {missing}"
+    passed = bool(oom is None and float(worst) <= gate_GB)          # a numpy bool crashed the JSON write
+    return dict(passed=passed, gate_GB=gate_GB, worst_GB=round(float(worst), 2), why=oom or why,
+                keys=list(gate_keys) if gate_keys is not None else None)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backbone", default="Qwen/Qwen2.5-1.5B")
@@ -41,6 +92,9 @@ def main():
     ap.add_argument("--gate_keys", nargs="*", default=None,
                     help="gate only these measurements (e.g. teacher_head: what the eval queue runs, not the all-heads "
                          "teacher pass nothing but B5's field-filtered trace incurs); default: all")
+    ap.add_argument("--b5", action="store_true",
+                    help="teacher mode: also measure B5's pass 1 (ctx.keep_dense on every patched layer, fields E and "
+                         "supp_rel, every head) as key teacher_b5 -- the one all-heads pass the eval queue runs (dense, 8K)")
     ap.add_argument("--modes", nargs="*", default=["teacher", "train"])
     ap.add_argument("--chunk", type=int, default=1024)
     ap.add_argument("--out", default="runs/memory_profile.json")
@@ -100,10 +154,25 @@ def main():
         ids = torch.randint(0, 1000, (1, T)).cuda()
         entry = {}
         for mode in args.modes:
-            for sub in ([False, True] if mode == "teacher" else [False]):
+            # teacher (all heads at l*, every field), teacher_head (the measurement sites only: what every queue job
+            # runs) and, with --b5, teacher_b5: B5's pass 1 -- every head of EVERY patched layer kept, fields E and
+            # supp_rel only, the one all-heads pass the eval queue incurs (dense, 8K, E2)
+            subs = ([False, True] + (["b5"] if args.b5 else [])) if mode == "teacher" else [False]
+            for sub in subs:
                 gc.collect(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
                 try:
-                    if mode == "teacher":
+                    if mode == "teacher" and sub == "b5":
+                        model.eval(); ctx.keep_dense = True
+                        try:
+                            _, _, diags = teacher_forced_pass(model, ctx, ids[0, :-8].tolist(), ids[0, -8:].tolist(),
+                                                              layers[-1], fields=("E", "supp_rel"))
+                        finally:
+                            ctx.keep_dense = False
+                        peak, _ = _mem()
+                        retained = sum(_tensor_bytes(v) for dd in diags.values()
+                                       for v in list(dd.__dict__.values()) + [dd.extra]) / 2**30
+                        del diags
+                    elif mode == "teacher":
                         model.eval()
                         hs = list(range(3, 3 + max(1, args.sites))) if sub else None
                         sites_arg = None if hs is None else [(layers[-1], h) for h in hs]
@@ -121,15 +190,7 @@ def main():
                         peak, _ = _mem()
                         # what the diagnostics themselves hold (F-8): the quantity head sub-selection and the field
                         # filter cut, and the one that accumulates when several passes are alive at once
-                        def _bytes(o):
-                            if torch.is_tensor(o):
-                                return o.element_size() * o.nelement()
-                            if isinstance(o, dict):                      # extra["sparse"] is a DICT of tensors: the
-                                return sum(_bytes(v) for v in o.values())  # chunked path's whole sparse store lives here
-                            if isinstance(o, (list, tuple)):
-                                return sum(_bytes(v) for v in o)
-                            return 0
-                        retained = sum(_bytes(v) for dd in diags.values()
+                        retained = sum(_tensor_bytes(v) for dd in diags.values()
                                        for v in list(dd.__dict__.values()) + [dd.extra]) / 2**30
                         del diags
                     else:
@@ -143,9 +204,9 @@ def main():
                         train_step(model, ctx, opt, _Data(), 0, 0, tcfg, lambda r: None)
                         peak, _ = _mem(); retained = 0.0
                         opt.zero_grad(set_to_none=True)
-                    entry[f"{mode}{'_head' if sub else ''}"] = dict(peak_GB=round(peak, 3), retained_GB=round(max(0.0, retained), 3))
+                    entry[_key(mode, sub)] = dict(peak_GB=round(peak, 3), retained_GB=round(max(0.0, retained), 3))
                 except torch.OutOfMemoryError:
-                    entry[f"{mode}{'_head' if sub else ''}"] = dict(oom=True)
+                    entry[_key(mode, sub)] = dict(oom=True)
                 gc.collect(); torch.cuda.empty_cache()
         res["points"][T] = entry
         print(f"T = {T}: {json.dumps(entry)}")
@@ -245,32 +306,13 @@ def main():
     if args.gate_GB is not None:
         # the verdict is written INTO the profile, so run_s2.sh can refuse a configuration preflight did not pass
         # (review e982f83 B-4) instead of trusting a comment
-        gated = (lambda k: True) if args.gate_keys is None else (lambda k: k in args.gate_keys)
-        worst, why, oom = 0.0, None, None
-        for T, entry in res["points"].items():
-            for k, v in entry.items():
-                if not gated(k):
-                    continue
-                if v.get("oom"):
-                    oom = f"OOM at T = {T} ({k})"
-                if v.get("peak_GB", 0) > worst:
-                    worst, why = v["peak_GB"], f"measured {k} at T = {T}"
-        for key, ex in res["extrapolation"].items():
-            if not gated(key):
-                continue
-            for t in args.targets:
-                for kk in (str(t), f"{t}_at_4_layers"):
-                    if ex.get(kk) and ex[kk] > worst:
-                        worst, why = ex[kk], f"extrapolated {key} at {kk}"
-        passed = bool(oom is None and float(worst) <= args.gate_GB)          # a numpy bool crashed the JSON write
-        worst = float(worst)
-        res["gate"] = dict(passed=passed, gate_GB=args.gate_GB, worst_GB=round(worst, 2), why=oom or why,
-                           keys=args.gate_keys)
+        g = res["gate"] = gate_verdict(res["points"], res["extrapolation"], args.targets, args.gate_GB, args.gate_keys)
         pathlib.Path(args.out).write_text(json.dumps(res, indent=1))
-        if oom:
-            print(f"GATE FAILED: {oom}"); sys.exit(3)
-        print(f"GATE: worst peak {worst:.1f} GB ({why}) against {args.gate_GB:.0f} GB")
-        if not passed:
+        hard = g["why"] if g["why"] and not g["why"].startswith(("measured", "extrapolated")) else None
+        if hard:                                                          # an OOM, or a gated key the probe never ran
+            print(f"GATE FAILED: {hard}"); sys.exit(3)
+        print(f"GATE: worst peak {g['worst_GB']:.1f} GB ({g['why']}) against {args.gate_GB:.0f} GB")
+        if not g["passed"]:
             print("GATE FAILED"); sys.exit(3)
         print("GATE PASSED")
 
