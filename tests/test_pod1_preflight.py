@@ -178,3 +178,24 @@ def test_per_head_biases_are_recorded_as_lists_not_item():
         rec = bias_record(per.last_bias); assert isinstance(rec, list) and len(rec) == 12
     src = (ROOT / "marsea/train.py").read_text()
     assert "last_bias.item()" not in src
+
+
+def test_generation_prefill_gets_E_under_head_blocking():
+    """Eval smoke test, 2026-09-19: dense-path generation with --head_block 2 crashed in init_from_prefill on ~E with
+    E = None.  The head-block merge includes E only when want_E is set, and the backbone set it from ctx.collect and
+    want_dense_diag alone; generation sets neither."""
+    import torch
+    from conftest import rand_case
+    import numpy as np
+    from marsea.normalizer import MarSeaNormalizer
+    case = rand_case(np.random.default_rng(3), n_q=12, n_k=12, H=4, Hkv=2, B=1, D=16)
+    nm = MarSeaNormalizer(16, head_block=2)
+    nm.want_dense_diag = False
+    nm.want_E = False
+    _, d = nm.normalize(case["S"], case["vis"], case["K_kv"], case["Q"])
+    assert d.E is None, "the merge drops E unless asked: that is the saving, and why the prefill must ask"
+    nm.want_E = True
+    _, d = nm.normalize(case["S"], case["vis"], case["K_kv"], case["Q"])
+    assert torch.is_tensor(d.E) and d.E.shape == case["S"].shape and d.tau_j is not None and d.cbar_j is not None and d.nu is not None
+    src = (ROOT / "marsea/backbone.py").read_text()
+    assert "want_E = bool(ctx.collect or self.normalizer.want_dense_diag or ctx.generation)" in src

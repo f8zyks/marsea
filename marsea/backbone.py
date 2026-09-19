@@ -288,7 +288,12 @@ class MarSeaAttention(nn.Module):
                     # step is pure waste (review 2026-09-12, fix 4).  E is the exception: the e8 summary IS computed
                     # from it, so it follows ctx.collect (review d5bd980 B-1).
                     self.normalizer.want_dense_diag = bool(ctx.keep_dense or self.layer_idx in ctx.keep_dense_layers)
-                    self.normalizer.want_E = bool(ctx.collect or self.normalizer.want_dense_diag)
+                    # ... and the GENERATION prefill: FrozenPrefixCache.init_from_prefill reads diag.E to seed the decode
+                    # cache.  With head blocking the merged diagnostics carry E only on request, generation does not set
+                    # ctx.collect, and every dense-path generation job with --head_block (the whole 8K eval queue) died
+                    # on `~E` with E = None (eval smoke test, 2026-09-19).  Without head blocking E is always there,
+                    # which is why no test saw it.
+                    self.normalizer.want_E = bool(ctx.collect or self.normalizer.want_dense_diag or ctx.generation)
                 A, diag = self.normalizer.normalize(S, vis, k, q, state, **kw)
                 ctx.nu[self.layer_idx] = state.nu_next
                 if ctx.generation:                                                # prefill: seed the decode cache
