@@ -199,3 +199,18 @@ def test_generation_prefill_gets_E_under_head_blocking():
     assert torch.is_tensor(d.E) and d.E.shape == case["S"].shape and d.tau_j is not None and d.cbar_j is not None and d.nu is not None
     src = (ROOT / "marsea/backbone.py").read_text()
     assert "want_E = bool(ctx.collect or self.normalizer.want_dense_diag or ctx.generation)" in src
+
+
+def test_aggregate_handles_hotpots_joint_dict():
+    """Eval smoke test, 2026-09-19: every E5 hotpot job would have died in aggregate_ruler on float(dict)."""
+    from marsea.evaluate import aggregate_ruler
+    from marsea.data.qa import hotpot_joint
+    j = hotpot_joint("paris", "paris", {("A", 0)}, {("A", 0)})
+    assert isinstance(j, dict) and "joint_em" in j
+    rows = [dict(m=1, ans_em=1.0, ans_f1=1.0, support_F1=1.0, joint=j),
+            dict(m=1, ans_em=0.0, ans_f1=0.5, support_F1=0.0, joint=hotpot_joint("rome", "paris", set(), {("A", 0)})),
+            dict(m=1, ans_em=1.0, ans_f1=1.0)]                                     # a MuSiQue-style row: no joint
+    table = aggregate_ruler(rows, stratify="m")
+    cell = table[1] if 1 in table else table["1"]
+    assert cell["joint_em"] == 0.5 and "joint_f1" in cell and cell["ans_em"] == 2 / 3
+    assert "joint" not in cell

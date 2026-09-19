@@ -512,8 +512,18 @@ def aggregate_ruler(rows: list[dict], stratify: str = "m") -> dict:
         # ruler_recall plus the attention block, so the E5 table reported exact_set_acc = nan and nothing else
         # (review d5bd980 F).
         for k_ in ("ans_em", "ans_f1", "support_P", "support_R", "support_F1", "support_EM", "joint"):
-            if r.get(k_) is not None:
-                g.setdefault("qa", {}).setdefault(k_, []).append(float(r[k_]))
+            v_ = r.get(k_)
+            if v_ is None:
+                continue
+            if isinstance(v_, dict):
+                # HotpotQA's `joint` is hotpot_joint()'s DICT (joint_em / joint_f1 / joint_p / joint_r beside the answer
+                # and support parts already aggregated above); float() of it killed every E5 hotpot table -- MuSiQue
+                # rows carry no `joint`, which is why only hotpot failed (eval smoke test, 2026-09-19)
+                for kk, vv in v_.items():
+                    if kk.startswith("joint") and vv is not None:
+                        g.setdefault("qa", {}).setdefault(kk, []).append(float(vv))
+            else:
+                g.setdefault("qa", {}).setdefault(k_, []).append(float(v_))
         att = r.get("attention")
         if att:
             g["measurable"].append(not att.get("cols_not_measurable"))
