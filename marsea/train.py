@@ -274,6 +274,15 @@ def load_checkpoint(path, model, opt=None):
 INIT_GAP_BOUND = 0.05
 
 
+def bias_record(t) -> "float | list":
+    """A head's last-layer bias for the README: a float for the shared heads, a list for the per-head arm (E9 per_head:
+    TauK / TauQ carry one bias per Q-head, shape [H, 1]).  `.item()` on that tensor killed the per_head arm inside
+    phase_b_init the first time it ever reached it (2026-09-19) -- the arm the queue's own comment says "must be run,
+    not unit-tested"."""
+    v = [float(x) for x in t.detach().flatten().tolist()]
+    return v[0] if len(v) == 1 else v
+
+
 def init_gap_verdict(sanity: dict, policy: str = "stop") -> str:
     """Phase-B init sanity 5(b).  A non-finite live loss always raises.  A gap over the bound raises under "stop" -- the
     procedure: "STOP and inspect, do not train through it" -- and returns "recorded" under "record", which exists for one
@@ -346,7 +355,7 @@ def phase_b_init(model, ctx: MarSeaContext, data, cursor: int, cfg: TrainConfig,
         nm.tauQ.set_init_tau(1.0)
         calib[l] = dict(b0=float(nm.relation.b0), coverage=float((vals + nm.relation.b0.item() > 0).float().mean()),
                         n_candidates=int(vals.numel()), tauK_target=float(target),
-                        tauK_bias=float(nm.tauK.last_bias.item()), tauQ_bias=float(nm.tauQ.last_bias.item()))
+                        tauK_bias=bias_record(nm.tauK.last_bias), tauQ_bias=bias_record(nm.tauQ.last_bias))
     ctx.capture_inputs = False
     # sanity 5(a): E forced empty reproduces Phase A's loss; 5(b): live loss within 5 %, no NaN
     loss_live = 0.0; cov = {l: [] for l in norms}

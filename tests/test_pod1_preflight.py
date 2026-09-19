@@ -162,3 +162,19 @@ def test_run_train_expands_a_quoted_eval_glob():
     rt = (ROOT / "scripts/run_train.py").read_text()
     assert "glob.has_magic(pat)" in rt and "matches no file" in rt
     assert "for f in args.eval_ruler for r in load_jsonl(f)" not in rt
+
+
+def test_per_head_biases_are_recorded_as_lists_not_item():
+    """The per_head E9 arm died in phase_b_init on its first real run: TauK.last_bias is [H, 1] there and the README
+    record called .item() on it."""
+    import torch
+    from marsea.train import bias_record
+    from marsea.heads import TauK, TauQ
+    assert bias_record(torch.tensor([0.25])) == 0.25
+    assert bias_record(torch.zeros(12, 1)) == [0.0] * 12
+    for cls in (TauK, TauQ):
+        shared, per = cls(8), cls(8, per_head=12)
+        assert isinstance(bias_record(shared.last_bias), float)
+        rec = bias_record(per.last_bias); assert isinstance(rec, list) and len(rec) == 12
+    src = (ROOT / "marsea/train.py").read_text()
+    assert "last_bias.item()" not in src
