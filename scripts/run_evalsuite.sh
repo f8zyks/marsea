@@ -64,7 +64,10 @@ if not pathlib.Path(sys.argv[1]).exists():
 for seed in (0, 1, 2):
     if any(pathlib.Path(f"runs/{arm}_seed{seed}/final.pt").exists() for arm in ("B0", "B1", "B2", "B4")) \
             and not pathlib.Path(f"runs/marsea_seed{seed}/final.pt").exists():
-        bad.append(f"runs/marsea_seed{seed}/final.pt is missing but dense arms of seed {seed} exist (their paired relation)")
+        if os.environ.get("ALLOW_MISSING_ARMS", "0") == "1":
+            print(f"NOTE: runs/marsea_seed{seed}/final.pt is not there yet: the dense arms' paired jobs of seed {seed} are DEFERRED to a later run")
+        else:
+            bad.append(f"runs/marsea_seed{seed}/final.pt is missing but dense arms of seed {seed} exist (their paired relation)")
 # the two-model paired evaluation's memory verdict (preflight 4, recorded rather than fatal there)
 try:
     g = (json.load(open("runs/preflight_eval_paired.json")).get("gate") or {})
@@ -120,6 +123,32 @@ if (( BASH_VERSINFO[0] < 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 1) ))
   echo "run_evalsuite.sh needs bash >= 5.1 for 'wait -n -p' (this is $BASH_VERSION)" >&2; exit 1
 fi
 SLOT_PID=(); SLOT_TAG=(); FAILED_JOBS=()
+# ---- several pods, several volumes (2026-09-19: the grid finished piecemeal on seven pods and two volumes, and the
+# evaluation started while B2 was still training).
+#   SHARD=k/n      a STATIC split for pods that do not share a volume, by a hash of the job's TAG -- stable whatever
+#                  checkpoints exist yet, so a job never changes sides between a first run and a later one.
+#   MULTI_POD=1    pods sharing ONE volume: a job is claimed by an atomic mkdir of runs/eval/claims/<tag> holding the
+#                  owner's POD_ID (default: hostname).  flock is NOT honoured across pods on either RunPod volume
+#                  (tested), so the claim is the only cross-pod guard.  Another pod's claim is skipped without using a
+#                  slot; a pod's own claim is a re-run (the .done marker already skips finished jobs).
+#   GPUS="1"       use these physical GPUs (NGPU = how many): a pod may still be training on its other card.
+SHARD=${SHARD:-0/1}
+[[ "$SHARD" =~ ^([0-9]+)/([1-9][0-9]*)$ ]] && (( BASH_REMATCH[1] < BASH_REMATCH[2] )) || { echo "run_evalsuite.sh: SHARD must be k/n with 0 <= k < n (got '$SHARD')" >&2; exit 1; }
+SHARD_K=${BASH_REMATCH[1]}; SHARD_N=${BASH_REMATCH[2]}
+MULTI_POD=${MULTI_POD:-0}; POD_ID=${POD_ID:-$(hostname)}
+SKIPPED_SHARD=(); SKIPPED_CLAIMED=(); DEFERRED=()
+GPU_LIST=(); if [ -n "${GPUS:-}" ]; then
+  read -r -a GPU_LIST <<< "$GPUS"
+  for g in "${GPU_LIST[@]}"; do [[ "$g" =~ ^[0-9]+$ ]] || { echo "run_evalsuite.sh: GPUS must be a list of GPU indices (got '$GPUS')" >&2; exit 1; }; done
+  NGPU=${#GPU_LIST[@]}
+fi
+gpu_of() { if [ ${#GPU_LIST[@]} -gt 0 ]; then echo "${GPU_LIST[$1]}"; else echo "$1"; fi; }
+claim() {
+  [ "$MULTI_POD" = "1" ] || return 0
+  mkdir -p runs/eval/claims
+  if mkdir "runs/eval/claims/$1" 2>/dev/null; then echo "$POD_ID" > "runs/eval/claims/$1/owner"; return 0; fi
+  [ "$(cat "runs/eval/claims/$1/owner" 2>/dev/null)" = "$POD_ID" ]
+}
 wait_one() {                                  # block until ANY running job ends; record its status and free its GPU
   local pid="" rc=0 g
   wait -n -p pid "${SLOT_PID[@]}" || rc=$?
@@ -139,6 +168,10 @@ barrier() {                                   # drain everything (between sectio
 launch() { # launch <tag> <command...>
   local tag=$1; shift
   [ -f "runs/eval/$tag.done" ] && { echo "skip $tag (done)"; return 0; }
+  if (( SHARD_N > 1 )); then
+    local h; h=$(printf '%s' "$tag" | cksum | cut -d' ' -f1)
+    if (( h % SHARD_N != SHARD_K )); then SKIPPED_SHARD+=("$tag"); return 0; fi
+  fi
   local gpu="" g
   while [ -z "$gpu" ]; do
     for ((g = 0; g < NGPU; g++)); do
@@ -146,8 +179,12 @@ launch() { # launch <tag> <command...>
     done
     [ -n "$gpu" ] || wait_one
   done
-  echo "[gpu $gpu] $tag"
-  ( CUDA_VISIBLE_DEVICES=$gpu "$@" > "runs/eval/log_$tag.txt" 2>&1 && touch "runs/eval/$tag.done" ) &
+  if ! claim "$tag"; then                      # AFTER the slot is ours: a full pod must not sit on a claim
+    echo "[claimed by $(cat "runs/eval/claims/$tag/owner" 2>/dev/null || echo another pod)] $tag -- skipped here"
+    SKIPPED_CLAIMED+=("$tag"); return 0
+  fi
+  echo "[gpu $(gpu_of $gpu)] $tag"
+  ( CUDA_VISIBLE_DEVICES=$(gpu_of $gpu) "$@" > "runs/eval/log_$tag.txt" 2>&1 && touch "runs/eval/$tag.done" ) &
   SLOT_PID[$gpu]=$!; SLOT_TAG[$gpu]=$tag
   return 0
 }
@@ -162,6 +199,9 @@ for seed in 0 1 2; do
   for arm in $ARMS; do
     ck="runs/${arm}_seed${seed}/final.pt"; [ -f "$ck" ] || continue          # inventoried above
     paired=""; case $arm in B0|B1|B2|B4) paired="--paired_marsea_ckpt runs/marsea_seed${seed}/final.pt";; esac
+    if [ -n "$paired" ] && [ ! -f "runs/marsea_seed${seed}/final.pt" ]; then
+      echo "defer ${arm}_s${seed}: its paired MarSea checkpoint is not there yet"; DEFERRED+=("${arm}_s${seed}"); continue
+    fi
     base="--arm $arm --ckpt $ck --detector $DET --seed $seed"
     # E2: the m-sweep at 8K
     run "${arm}_s${seed}_E2" $base --set "data/ruler/E2_L8192_K8_V*_s${seed}" --stratify m --experiment E2 $paired
@@ -218,11 +258,16 @@ fi
 # B5 last (D-29: teacher-forced only; its task-level cell reads "n/a by design")
 for seed in 0 1 2; do
   [ -f "runs/B0_seed${seed}/final.pt" ] || continue                             # inventoried above
+  [ -f "runs/marsea_seed${seed}/final.pt" ] || { echo "defer B5_s${seed}: its MarSea checkpoint is not there yet"; DEFERRED+=("B5_s${seed}"); continue; }
   run "B5_s${seed}_E2" --arm B5 --ckpt "runs/B0_seed${seed}/final.pt" --detector $DET --seed $seed \
       --set "data/ruler/E2_L8192_K8_V*_s${seed}" --stratify m --experiment E2 --modes teacher \
       --b5_marsea_ckpt "runs/marsea_seed${seed}/final.pt"
 done
 barrier
+if [ ${#SKIPPED_SHARD[@]} -gt 0 ] || [ ${#SKIPPED_CLAIMED[@]} -gt 0 ] || [ ${#DEFERRED[@]} -gt 0 ]; then
+  echo "=== this run's share is done (SHARD=$SHARD, POD_ID=$POD_ID): ${#SKIPPED_SHARD[@]} job(s) belong to other shards, ${#SKIPPED_CLAIMED[@]} to other pods, ${#DEFERRED[@]} arm x seed(s) deferred (${DEFERRED[*]:-none})"
+  echo "    the evaluation is complete only when every shard has run with nothing deferred; merge runs/eval/ before collect.py"
+fi
 if [ ${#SKIPPED_ARMS[@]} -gt 0 ]; then
   # an arm with no checkpoint used to be dropped without a word and the queue exited 0: B3 missing, collect.py
   # reporting on what exists, nothing saying so (review 7814665 F-4).  Named at the top (ALLOW_MISSING_ARMS=1 got us
