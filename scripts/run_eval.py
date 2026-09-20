@@ -223,6 +223,9 @@ def main():
                 ckpt_arm_kwargs=(meta.get("config") or {}).get("arm_kwargs"),
                 paired_marsea_ckpt=args.paired_marsea_ckpt if paired is not None else None,
                 git=git_hash(), spec_version=SPEC_VERSION, mode=args.mode, head_block=args.head_block,
+                # the path the arm RAN on: load_arm forces dense for a checkpoint that trained dense, and `mode` alone said
+                # `chunked` for the three dense-trained E9 arms (K64, uniform_quota, its control) in the 2026-09 campaign
+                mode_effective=ctx.mode,
                 baseline_head_block=args.baseline_head_block, cuda_alloc_conf=os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
                 detector=args.detector, detector_sha256=sha256_file(args.detector) if det else None,
                 l_star=l_star, h_star=h_star, patched_layers=list(layers), sites=[list(s) for s in sites],

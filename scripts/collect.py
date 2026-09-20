@@ -212,7 +212,24 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--eval_dir", default="runs/eval")
     ap.add_argument("--out", default=None, help="default: <eval_dir>/collected.{json,md}")
+    ap.add_argument("--equivalent_commits", default=None,
+                    help="a JSON declaration {commits: [hash, ...], evidence: str, decided_by: str, date: str}: these commits "
+                         "are ONE commit for the pooling rule.  For a campaign whose queue was fixed mid-run by a commit that "
+                         "does not touch the pooled arms' path; the declaration and the jobs it pooled go into collected.json")
     args = ap.parse_args()
+    equiv = None
+    if args.equivalent_commits:
+        equiv = json.loads(pathlib.Path(args.equivalent_commits).read_text())
+        commits = [str(c) for c in equiv.get("commits") or []]
+        if len(commits) < 2 or any(len(c) < 7 for c in commits) or not str(equiv.get("evidence") or "").strip():
+            sys.exit("--equivalent_commits needs >= 2 commit hashes of >= 7 characters and a non-empty `evidence`")
+        equiv = dict(equiv, commits=commits, pooled_jobs=[])
+
+    def canon_git(g: str) -> str:
+        g = (g or "").replace("+dirty", "")
+        if equiv and g and any(g.startswith(c) or c.startswith(g) for c in equiv["commits"]):
+            return "equivalent:" + "=".join(c[:7] for c in equiv["commits"])
+        return g
     ed = pathlib.Path(args.eval_dir)
     tables = sorted(ed.glob("*_table.json"))
     if not tables:
@@ -230,9 +247,11 @@ def main():
                                 e8="per patched layer; scalars are {mean, std, n_seeds, per_seed} over seeds, histograms "
                                    "pooled over seeds"))
     for job, items in sorted(jobs.items()):
-        keyset = {(p.get("arm"), p.get("experiment"), (p.get("git") or "").replace("+dirty", ""), p.get("detector_sha256"))
+        keyset = {(p.get("arm"), p.get("experiment"), canon_git(p.get("git")), p.get("detector_sha256"))
                   for _, _, p in items}
         conflict = len(keyset) > 1
+        if equiv and not conflict and len({(p.get("git") or "").replace("+dirty", "") for _, _, p in items}) > 1:
+            equiv["pooled_jobs"].append(job)                          # pooled ONLY because of the declaration: say so
         if conflict:
             result["provenance_conflicts"][job] = sorted(map(str, keyset))
             print(f"!! {job}: seeds disagree on (arm, experiment, git, detector) -- emitted per seed, not pooled",
@@ -284,8 +303,14 @@ def main():
             ("n" if "_E3" in job and "depth" not in job else "depth" if "depth" in job else "m")
         result["coverage"][job] = coverage_by_stratum(rows_all, strat, seeds)
     out = pathlib.Path(args.out) if args.out else ed / "collected"
+    if equiv:
+        result["commit_equivalence"] = equiv
     out.with_suffix(".json").write_text(json.dumps(result, indent=1, default=str))
     md = ["# Collected evaluation tables", ""]
+    if equiv:
+        md += [f"**Commits declared equivalent for pooling** ({', '.join(c[:7] for c in equiv['commits'])}; "
+               f"{equiv.get('decided_by', '?')}, {equiv.get('date', '?')}): {equiv['evidence']}  ",
+               f"Jobs pooled across them: {', '.join(equiv['pooled_jobs']) or 'none'}.", ""]
     for job, strata in result["jobs"].items():
         md += [f"## {job}  (seeds {strata['_seeds']})", "", "| stratum | metric | mean | std | n seeds |", "|---|---|---|---|---|"]
         for s, m in strata.items():
