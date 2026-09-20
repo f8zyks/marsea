@@ -23,7 +23,7 @@ import torch.nn as nn
 
 from .normalizer import State, Diagnostics, broadcast_vis
 from .relation import repeat_kv
-from .baselines import SoftmaxNorm
+from .baselines import SoftmaxNorm, SoftmaxOneNorm, MESHNorm, RowEntmaxNorm
 
 SUPPORTED_FAMILIES = ("qwen2", "llama")
 
@@ -119,6 +119,8 @@ class MarSeaContext:
                                                          # side at the detector's (l*, h*), so a pass can need two.
     keep_dense_fields: Optional[tuple] = None            # F-8: keep only these Diagnostics fields (B5 needs E, supp_rel)
     capture_inputs: bool = False
+    baseline_head_block: Optional[int] = None            # EVALUATION of B0/B1/B2/B4: that many Q-heads at a time on the
+                                                         # dense path (see _baseline_by_head_block)
 
     def reset_forward(self, pad_mask):
         self.pad_mask = pad_mask
@@ -188,6 +190,46 @@ class MarSeaAttention(nn.Module):
         attn_output = self.marsea_eager_forward(q, k, v)                         # [B, n_q, H*d]
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         return self.o_proj(attn_output), None
+
+    @torch.no_grad()
+    def _baseline_by_head_block(self, norm, q, k_rep, v_rep, vis, hb: int, kept: bool):
+        """The dense baselines (B0, B1, B2, B4), `hb` Q-heads at a time -- evaluation only (no grad).
+
+        Their normalisers act on each head alone (row-wise for B0/B1/B4; B2's marginals, Sinkhorn and MESH step are
+        per head), so the blocks give the numbers the full call gives -- except B2's 1e-6 cost noise, which is drawn
+        per block.  The full call holds several [B, H, T, T] fp32 tensors at once: at 16K one is 12 GB, B4's stable
+        sort alone adds 12 + 24 GB, and B4_s0_E3pad died at 138 GB on a card it had to itself (2026-09-20); B2's MESH
+        step, which differentiates through five Sinkhorn iterations, is far beyond that.  Nothing of size [B, H, T, T]
+        is built here: each block's A is mixed into the output at once, and only the heads the evaluator asked for
+        (ctx.dense_head_for) are kept, in the order head_index would give them."""
+        ctx = self.ctx
+        H = q.shape[1]
+        h = ctx.dense_head_for(self.layer_idx) if kept else None
+        want = [] if h is None else ([int(h)] if isinstance(h, int) else [int(x) for x in h])
+        outs, got, extras = [], {"A": {}, "A_sm": {}}, {}
+        for h0 in range(0, H, hb):
+            h1 = min(H, h0 + hb)
+            v_blk = vis if vis.shape[1] == 1 else vis[:, h0:h1]
+            S = (torch.matmul(q[:, h0:h1], k_rep[:, h0:h1].transpose(2, 3)) * self.scaling).masked_fill(~v_blk, float("-inf"))
+            A, d = norm.normalize(S, v_blk, k_rep[:, h0:h1], q[:, h0:h1], State(nu_prev=None))
+            outs.append(torch.matmul(A.to(q.dtype), v_rep[:, h0:h1]))
+            if ctx.collect:
+                for hg in want:
+                    if h0 <= hg < h1:
+                        for name in ("A", "A_sm"):
+                            t = getattr(d, name, None)
+                            if t is not None:
+                                same = name == "A_sm" and d.A_sm is d.A and hg in got["A"]
+                                got[name][hg] = got["A"][hg] if same else t[:, hg - h0:hg - h0 + 1].detach().clone()
+                for kx, tx in d.extra.items():
+                    extras.setdefault(kx, []).append(tx.detach() if torch.is_tensor(tx) else tx)
+            del S, A, d
+        diag = Diagnostics(extra={kx: (torch.cat(v, 1) if torch.is_tensor(v[0]) else v[0]) for kx, v in extras.items()})
+        for name in ("A", "A_sm"):
+            if got[name]:
+                setattr(diag, name, torch.cat([got[name][hg] for hg in want], 1))
+        diag.extra["baseline_head_block"] = hb
+        return torch.cat(outs, 1), diag
 
     @torch.no_grad()
     def _fp32_scores(self, q, k, vis):
@@ -266,11 +308,23 @@ class MarSeaAttention(nn.Module):
         # ---- dense path
         k_rep = repeat_kv(k, g)
         v_rep = repeat_kv(v, g)
-        S = torch.matmul(q, k_rep.transpose(2, 3)) * self.scaling               # bf16 under autocast
-        S = S.masked_fill(~vis, float("-inf"))                                   # replaces the additive mask (C-26)
+        base_norm = self.softmax_norm if (ctx.phase_a or not hasattr(self.normalizer, "normalize")) else self.normalizer
+        kept = bool(ctx.collect and (ctx.keep_dense or self.layer_idx in ctx.keep_dense_layers))
+        blocked = bool(ctx.baseline_head_block and H > ctx.baseline_head_block and n_q > 1
+                       and isinstance(base_norm, (SoftmaxNorm, SoftmaxOneNorm, MESHNorm, RowEntmaxNorm))
+                       and not torch.is_grad_enabled() and not self.training and not ctx.capture_inputs
+                       and not (kept and ctx.dense_head_for(self.layer_idx) is None))   # every head kept: nothing to save
+        S = None
+        if blocked:
+            out, diag = self._baseline_by_head_block(base_norm, q, k_rep, v_rep, vis, int(ctx.baseline_head_block), kept)
+        else:
+            S = torch.matmul(q, k_rep.transpose(2, 3)) * self.scaling           # bf16 under autocast
+            S = S.masked_fill(~vis, float("-inf"))                               # replaces the additive mask (C-26)
         if ctx.capture_inputs:
             ctx.last_S[self.layer_idx] = (S.detach().float(), vis, k.detach(), q.detach())
-        if ctx.phase_a or not hasattr(self.normalizer, "normalize"):
+        if blocked:
+            pass
+        elif ctx.phase_a or not hasattr(self.normalizer, "normalize"):
             A, diag = self.softmax_norm.normalize(S, vis)
         else:
             state = State(nu_prev=ctx.nu_prev_for(self.layer_idx))
@@ -326,10 +380,10 @@ class MarSeaAttention(nn.Module):
             h = ctx.dense_head_for(self.layer_idx)
             if h is not None and (ctx.keep_dense or self.layer_idx in ctx.keep_dense_layers):
                                                                        # F-8: the kept heads, re-indexed from 0
-                hi = head_index(h, S.device)
+                hi = head_index(h, q.device)
                 for name in PER_HEAD_FIELDS:
-                    t = getattr(dd, name, None)
-                    if torch.is_tensor(t) and t.dim() >= 2 and t.shape[1] == S.shape[1]:
+                    t = getattr(dd, name, None)                          # the head-blocked baseline path kept only these heads
+                    if torch.is_tensor(t) and t.dim() >= 2 and t.shape[1] == H and not blocked:
                         setattr(dd, name, t[:, hi].contiguous())
                 dd.extra["head_sub"] = h
             if not (ctx.keep_dense or self.layer_idx in ctx.keep_dense_layers):
@@ -345,6 +399,8 @@ class MarSeaAttention(nn.Module):
                 # |s| in [8, 16)) makes spurious ties, W_j = 0 and hi = inf more often than the fp32 column (review B12)
                 dd.extra["S"] = self._fp32_scores(q, k, vis)
             ctx.diags[self.layer_idx] = dd
+        if blocked:
+            return out.transpose(1, 2)
         A = nn.functional.dropout(A, p=self.attention_dropout if self.training else 0.0, training=self.training)
         out = torch.matmul(A.to(q.dtype), v_rep)                                  # value-mix in the backbone's dtype
         return out.transpose(1, 2)

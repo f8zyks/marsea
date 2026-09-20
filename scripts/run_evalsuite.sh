@@ -20,6 +20,12 @@ done
 HEAD_BLOCK=${EVAL_HEAD_BLOCK:-2}                           # the EVALUATION head blocking, as preflight's eval probes profile it:
                                                            # NOT the training knob HEAD_BLOCK (0 for the 4K grid; unblocked, the
                                                            # 16K sites-only pass ran out of memory on the H200 -- pod 1 run 3)
+# The CUDA allocator: expandable segments.  The dense baselines' 16K paired jobs hold several [12, T, T] fp32 matrices at
+# once (the baseline path is not head-blocked); on the default allocator five of them died on 2026-09-19/20 with
+# "tried to allocate 11.8 GiB ... 98 GiB allocated, 32-41 GiB reserved but unallocated" -- fragmentation, on a card
+# they had to themselves.  It changes where blocks live, never a number.  An owner's own setting wins.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+BASELINE_HEAD_BLOCK=${BASELINE_HEAD_BLOCK:-2}
 N16K=${N16K:-400}           # examples per 16K job, spread evenly over its configs.  n = 1000 (5 configs x 200) is ~3x
                             # the compute table's evaluation budget (review e982f83 H) and E3's paired pass was
                             # sized at ~268 GB of host RAM per process (B-3).
@@ -203,6 +209,9 @@ for seed in 0 1 2; do
       echo "defer ${arm}_s${seed}: its paired MarSea checkpoint is not there yet"; DEFERRED+=("${arm}_s${seed}"); continue
     fi
     base="--arm $arm --ckpt $ck --detector $DET --seed $seed"
+    # B4's stable sort and B2's MESH step do not fit a 16K job with all 12 heads at once (B4_s0_E3pad: 138 GB, dead);
+    # head by head they give the same numbers.  Every job of those two arms, so an arm is evaluated one way throughout.
+    case $arm in B2|B4) base="$base --baseline_head_block $BASELINE_HEAD_BLOCK";; esac
     # E2: the m-sweep at 8K
     run "${arm}_s${seed}_E2" $base --set "data/ruler/E2_L8192_K8_V*_s${seed}" --stratify m --experiment E2 $paired
     # E3: the n-sweep at 16K -- the load-bearing experiment, chunked path, with the inert-padding control

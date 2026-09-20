@@ -119,6 +119,8 @@ def main():
     ap.add_argument("--mode", default="dense", choices=["dense", "chunked"]); ap.add_argument("--arm_kwargs", default="{}")
     ap.add_argument("--head_block", type=int, default=None,
                     help="Q-heads per block, as preflight profiles it; default: the checkpoint's training value")
+    ap.add_argument("--baseline_head_block", type=int, default=None,
+                    help="B0/B1/B2/B4: that many Q-heads at a time on the dense path (B4 and B2 do not fit a 16K job otherwise)")
     ap.add_argument("--b5_marsea_ckpt", default=None); ap.add_argument("--b5_marsea_kwargs", default="{}")
     ap.add_argument("--paired_marsea_ckpt", default=None, help="dense arms / B4: MarSea checkpoint whose relation E[l*,h*] defines the paired domain (m_j/|E_.j|)")
     ap.add_argument("--experiment", default="E2")
@@ -152,6 +154,7 @@ def main():
     seed = args.seed if args.seed is not None else (meta.get("config") or {}).get("seed")
     model, tok, ctx = load_arm(args.ckpt, args.arm, args.backbone, layers, json.loads(args.arm_kwargs), args.mode,
                                head_block=args.head_block, det=det)
+    ctx.baseline_head_block = args.baseline_head_block or None          # the ARM's model only; inert on MarSea / B3 / B5
     out = pathlib.Path(args.out); out.mkdir(parents=True, exist_ok=True)
     tag = args.tag or f"{args.arm}_{args.kind}_{args.experiment}_s{seed}"
     # D-9a: the coreference column is measured where S0 licensed it.  If that is not (l*, h*), the pass keeps TWO
@@ -220,6 +223,7 @@ def main():
                 ckpt_arm_kwargs=(meta.get("config") or {}).get("arm_kwargs"),
                 paired_marsea_ckpt=args.paired_marsea_ckpt if paired is not None else None,
                 git=git_hash(), spec_version=SPEC_VERSION, mode=args.mode, head_block=args.head_block,
+                baseline_head_block=args.baseline_head_block, cuda_alloc_conf=os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
                 detector=args.detector, detector_sha256=sha256_file(args.detector) if det else None,
                 l_star=l_star, h_star=h_star, patched_layers=list(layers), sites=[list(s) for s in sites],
                 s0_licensed=(det is not None and "s0_licence" in det), n_examples=len(rows),
