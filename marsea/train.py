@@ -483,15 +483,19 @@ def phase_b_init(model, ctx: MarSeaContext, data, cursor: int, cfg: TrainConfig,
                 vals = vals.cpu()
             raw_vals[l].append(vals)
             from .heads import column_stats
-            st = column_stats(S, vis)[..., 3]
-            stds[l].append(st[vis.expand_as(S).sum(-2) > 1].cpu())
+            st = column_stats(S, vis)[..., 3]; ok_cols = vis.expand_as(S).sum(-2) > 1
+            if nm.relation.per_head_b0 and nm.tauK.per_head:              # the recipe's per-head TauK: one spread per head
+                stds[l].append([st[:, h][ok_cols[:, h]].cpu() for h in range(st.shape[1])])
+            else:
+                stds[l].append(st[ok_cols].cpu())
     loss_a /= max(1, ntok)
     calib = {}
     for l, nm in norms.items():
         # F-6: b0 through the one bisection RelationHead.calibrate_b0 uses, over the one candidate set (vis minus the
         # D-31 sink pairs).  Counting sink pairs as candidates put realised coverage below rho_0 and wrote a coverage
         # number to the README that the run could not reproduce.
-        vals = torch.cat(raw_vals[l]); sd = torch.cat(stds[l])
+        vals = torch.cat(raw_vals[l])
+        sd = ([torch.cat([x[h] for x in stds[l]]) for h in range(len(stds[l][0]))] if isinstance(stds[l][0], list) else torch.cat(stds[l]))
         if nm.relation.per_head_b0:
             per_head = [torch.cat([hv[h] for hv in head_vals[l]]) for h in range(len(head_vals[l][0]))]
             nm.relation.calibrate_b0_per_head(per_head, rho0=cfg.rho0, iters=30)
@@ -502,7 +506,7 @@ def phase_b_init(model, ctx: MarSeaContext, data, cursor: int, cfg: TrainConfig,
         target = nm.tauK.calibrate(None, None, stds=sd)
         nm.tauQ.set_init_tau(1.0)
         calib[l] = dict(b0=bias_record(nm.relation.b0), coverage=coverage,
-                        n_candidates=int(vals.numel()), tauK_target=float(target),
+                        n_candidates=int(vals.numel()), tauK_target=(target if isinstance(target, list) else float(target)),
                         tauK_bias=bias_record(nm.tauK.last_bias), tauQ_bias=bias_record(nm.tauQ.last_bias))
     ctx.capture_inputs = False
     # sanity 5(a): E forced empty reproduces Phase A's loss; 5(b): live loss within 5 %, no NaN

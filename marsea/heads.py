@@ -141,9 +141,21 @@ class TauK(_Head):
         return self.tau_min + F.softplus(self._mlp(x, head_offset))
 
     @torch.no_grad()
-    def calibrate(self, S: torch.Tensor, vis: torch.Tensor, stds: torch.Tensor | None = None) -> float:
+    def calibrate(self, S: torch.Tensor, vis: torch.Tensor, stds=None):
         """Sec. 5.2 [v4]: bias := softplus^-1(median_j (1/std_j) - tau_min), a MEDIAN over columns with
         >= 2 visible entries.  `stds` may be passed pre-collected over several sequences."""
+        if self.per_head and (stds is None or isinstance(stds, (list, tuple))):
+            # one target per Q-head (2026-09-20 recipe): each head's columns have their own score spread, and one pooled
+            # median starts every head but the median one at the wrong sharpness.  `stds`: a list of 1-D tensors, per head.
+            if stds is None:
+                st = column_stats(S, vis)[..., 3]; ok = vis.bool().expand_as(S).sum(-2) > 1
+                stds = [st[:, h][ok[:, h]] for h in range(st.shape[1])]
+            assert len(stds) == self.per_head, (len(stds), self.per_head)
+            targets = []
+            for h, sd in enumerate(stds):
+                t = (1.0 / sd.clamp_min(STD_EPS)).median().item() if sd.numel() else 1.0
+                self.b2.data[h].fill_(inv_softplus(max(t - self.tau_min, 1e-3))); targets.append(t)
+            return targets
         if stds is None:
             st = column_stats(S, vis)[..., 3]
             stds = st[vis.bool().expand_as(S).sum(-2) > 1]

@@ -112,3 +112,27 @@ def test_quick_eval_reports_the_relation_at_the_answer_rows(monkeypatch):
     res = ev.quick_eval_factory([object()], [], None, 23, 2, "marsea")(None, None, 750)
     assert res["relation_recall_row"] == 0.5 and res["relation_size_row"] == 20 and res["relation_mass_row"] == 0.3
     assert res["relation_support_nonempty"] == 0.5
+
+
+def test_per_head_tau_heads_with_the_per_head_relation_and_their_per_head_calibration():
+    """the owner's 2026-09-20 decision: TauK and TauQ per Q-head too -- arm_kwargs {"relation_per_head": H, "per_head": H}."""
+    from marsea.heads import TauK, column_stats
+    norm = MarSeaNormalizer(D, R, relation_per_head=6, per_head=6).double()
+    assert norm.relation.per_head_b0 and norm.relation.b0.shape == (6,) and norm.tauK.per_head == 6 and norm.tauQ.per_head == 6
+    Q, K_kv, V_kv, vis = _case(160, B=1, Hkv=2, g=3, dtype=torch.float64)
+    Q[:, 3:] *= 4.0                                                        # heads 3-5: four times the score spread
+    S = (torch.einsum("bhid,bhjd->bhij", Q, K_kv.repeat_interleave(3, dim=1)) * D ** -0.5).masked_fill(~vis, float("-inf"))
+    targets = norm.tauK.calibrate(S, vis)
+    assert isinstance(targets, list) and len(targets) == 6 and min(targets[:3]) > 2.5 * max(targets[3:])   # 1/std per head
+    tau = norm.tauK(K_kv.repeat_interleave(3, dim=1), column_stats(S, vis), torch.ones(1, 6, 160, dtype=torch.float64))
+    for h in range(6):
+        assert abs(float(tau[0, h].median()) - targets[h]) < 0.05 * targets[h], (h, float(tau[0, h].median()), targets[h])
+    # pooled (a tensor of stds) still sets every head alike: the E9 per_head arm of 2026-09 is reproduced
+    t = norm.tauK.calibrate(None, None, stds=torch.tensor([0.5, 0.5, 2.0]))
+    assert isinstance(t, float) and torch.allclose(norm.tauK.b2, norm.tauK.b2[0].expand_as(norm.tauK.b2))
+    # and both paths still agree
+    with torch.no_grad():
+        norm.relation.calibrate_b0(K_kv, Q, vis, 0.3); norm.tauK.calibrate(S, vis)
+        O_d, A_d, dd = _dense(norm, Q, K_kv, V_kv, vis, State())
+        O_c, dc = marsea_chunked_attention(norm, Q, K_kv, V_kv, vis, State(), chunk=32, dense_outputs=True)
+    assert (dc.E == dd.E).all() and float((O_c - O_d).abs().max()) < 1e-9
