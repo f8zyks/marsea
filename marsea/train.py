@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from . import SPEC_VERSION
 from .backbone import load_backbone, patch_model, normalizers, MarSeaContext, _base_model
 from .baselines import make_normalizer
-from .normalizer import MarSeaNormalizer
+from .normalizer import MarSeaNormalizer, broadcast_vis
 from .heads import inv_softplus
 
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
@@ -64,6 +64,21 @@ class TrainConfig:
     calib_sequences: int = 8
     calib_subsample: int = 2_000_000           # visible pairs per sequence used for the b0 bisection
     detector_json: Optional[str] = None        # overrides patched_layers when present
+    # ---- the 2026-09-20 recipe (all off by default: the 2026-09 grid is reproduced unchanged).  That grid's relation ended
+    # inert: random at the start of Phase B, taught only by an LM loss Phase A had already minimised, it was pushed OFF
+    # the pairs that matter, and nothing held its coverage (0.0001 .. 0.40 per layer at the end).
+    relation_warmstart_steps: int = 0          # "Phase A 1/2": fit the relation logits to the Phase-A model's own
+                                               # high-attention pairs before the b0 calibration (relation_warmstart)
+    warmstart_mass: float = 0.10               # a target pair: row-softmax mass >= this, sink column excluded
+    warmstart_rows: int = 1024                 # query rows sampled per sequence and step
+    warmstart_lr: float = 3e-3
+    warmstart_sequences: int = 24              # the pool it cycles through, from the cursor on (NOT consumed)
+    recal_every: int = 0                       # re-bisect b0 (per head when the relation has per-head b0) every N steps
+    st_T0: float = 1.0                         # straight-through backward temperature at the start of Phase B ...
+    st_anneal_steps: int = 0                   # ... annealed linearly to 1 over this many steps
+    module_warmup_steps: int = 0               # the module groups' OWN linear warm-up from the start of Phase B
+    gate_min_relation_recall: float = 0.0      # quick eval: stop if the relation's recall of the gold keys at the
+    gate_after: int = 250                      #   answer rows is below this, this many Phase-B steps in (0 = no gate)
     allow_phase_a_layer_change: bool = False   # fork a Phase-A file saved under a different PATCHED_LAYERS (after S0)
     phase_a_patched: bool = True               # Phase A runs the PATCHED SoftmaxNorm layers, i.e. exactly the forward
                                                # Phase B forks into (B0 is Phase A continued, so S2 pays this memory
@@ -171,10 +186,17 @@ def make_optimizer(model, cfg, with_modules):
     return torch.optim.AdamW(param_groups(model, cfg, with_modules), betas=(0.9, 0.95), eps=1e-8)
 
 
+def module_warmup(step: int, cfg) -> float:
+    """the module groups start Phase B at the PEAK of a cosine that began at step 0 -- no warm-up of their own."""
+    if not cfg.module_warmup_steps:
+        return 1.0
+    return min(1.0, max(0.0, (step - cfg.phase_a_steps + 1) / cfg.module_warmup_steps))
+
+
 def apply_lr(opt, step, cfg, head_lr_scale=1.0):
     m = lr_multiplier(step, cfg.total_steps, int(cfg.warmup_frac * cfg.total_steps), cfg.final_lr_frac)
     for g in opt.param_groups:
-        base = cfg.lr_lora if g.get("name") == "G1" else cfg.lr_modules * head_lr_scale
+        base = cfg.lr_lora if g.get("name") == "G1" else cfg.lr_modules * head_lr_scale * module_warmup(step, cfg)
         g["lr"] = base * m
     return m
 
@@ -300,6 +322,117 @@ def init_gap_verdict(sanity: dict, policy: str = "stop") -> str:
     return "recorded"
 
 
+def _capture_phase_a(model, ctx, s, device):
+    """one forward on the SOFTMAX path with the patched layers' (S, vis, K, Q) captured.  Cheap, and exact for the first
+    patched layer; for the later ones q, k are those of a model whose earlier relations carry no mass."""
+    saved = (ctx.mode, ctx.phase_a, ctx.capture_inputs, ctx.collect, ctx.force_empty)
+    ctx.mode = "dense"; ctx.phase_a = True; ctx.capture_inputs = True; ctx.collect = False; ctx.force_empty = False
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        model(input_ids=s.input_ids.to(device), use_cache=False, logits_to_keep=1)
+    ctx.mode, ctx.phase_a, ctx.capture_inputs, ctx.collect, ctx.force_empty = saved
+    cap = dict(ctx.last_S); ctx.last_S = {}
+    return cap
+
+
+def _head_candidates(rel, K, Q, vis, n_sub: int):
+    """per Q-head 1-D candidate logits (no b0; vis minus the D-31 sink pairs), subsampled to n_sub each."""
+    from .relation import candidate_logits
+    raw = rel.raw(K.float(), Q.float()); out = []
+    for h in range(raw.shape[1]):
+        v = candidate_logits(raw[:, h:h + 1], vis)
+        if v.numel() > n_sub:
+            v = v[torch.randint(0, v.numel(), (n_sub,), device=v.device)]
+        out.append(v)
+    return out
+
+
+def _warmstart_targets(S, vis, rows, mass):
+    vis_r = broadcast_vis(vis, S)[:, :, rows]
+    A = torch.nan_to_num(torch.softmax(S[:, :, rows].float().masked_fill(~vis_r, float("-inf")), -1), nan=0.0)
+    cand = vis_r.clone(); cand[..., 0] = False                             # D-31: the sink column is never in a relation
+    return (A >= mass) & cand, cand
+
+
+def relation_warmstart(model, ctx, data, cursor: int, cfg: TrainConfig) -> dict:
+    """Phase A 1/2.  Everything frozen but the relation heads, which are fitted -- class-balanced BCE per head -- to the
+    Phase-A model's own high-attention pairs.  Phase B then starts from a relation that CONTAINS the pairs the heads use
+    (the random one contained none of the gold pairs, and the LM loss then pushed them further out).  Measured on the
+    2026-09 Phase-A model at l*: per-head heads recall 99.5 % of the target pairs at 1 % coverage, the gold pairs included."""
+    norms = {l: nm for l, nm in normalizers(model).items() if isinstance(nm, MarSeaNormalizer)}
+    params = [p for nm in norms.values() for p in nm.relation.parameters()]
+    flags = [p.requires_grad for p in params]
+    for p in params: p.requires_grad_(True)
+    opt = torch.optim.Adam(params, lr=cfg.warmstart_lr)
+    gen = torch.Generator(device="cpu").manual_seed(cfg.seed * 13 + 5)
+    was_training = model.training; model.eval(); hist = []
+
+    def step_loss(cap, train: bool):
+        total = 0.0; recall = {}
+        for l, nm in norms.items():
+            S, vis, K, Q = cap[l]; n_q = S.shape[-2]; H = S.shape[1]
+            rows = torch.randint(1, n_q, (min(cfg.warmstart_rows, n_q - 1),), generator=gen).unique().to(S.device)
+            T, cand = _warmstart_targets(S, vis, rows, cfg.warmstart_mass); cand = cand.expand_as(T)
+            lg = nm.relation.raw(K.float(), Q.float()[:, :, rows]) + nm.relation.b0_view(H)
+            if train:
+                npos = T.sum((0, 2, 3)).clamp_min(1).float(); nneg = (cand & ~T).sum((0, 2, 3)).clamp_min(1).float()
+                w = torch.where(T, (nneg / npos).clamp(max=2000.0).view(1, H, 1, 1), torch.ones((), device=S.device))
+                bce = F.binary_cross_entropy_with_logits(lg, T.float(), weight=w, reduction="none") * cand
+                total = total + (bce.sum((0, 2, 3)) / (w * cand).sum((0, 2, 3)).clamp_min(1)).mean()
+            else:                                                          # recall of the targets when each head admits rho0
+                rec = []
+                for h in range(H):
+                    v = lg[0, h][cand[0, h]]
+                    if v.numel() == 0 or not bool(T[0, h].any()): continue
+                    thr = torch.quantile(v[torch.randint(0, v.numel(), (min(v.numel(), 400_000),), device=v.device)].float(), 1 - cfg.rho0)
+                    rec.append(float(((lg[0, h] > thr) & T[0, h]).sum() / T[0, h].sum()))
+                recall[l] = float(np.mean(rec)) if rec else None
+        return total, recall
+
+    for k in range(cfg.relation_warmstart_steps):
+        cap = _capture_phase_a(model, ctx, data.get(cursor + k % cfg.warmstart_sequences), cfg.device)
+        with torch.enable_grad():
+            loss, _ = step_loss(cap, True)
+            opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
+        hist.append(float(loss) / max(1, len(norms)))
+        if k % 100 == 0:
+            print(f"[phase A 1/2] step {k} relation-fit loss {hist[-1]:.4f}")
+    with torch.no_grad():
+        _, recall = step_loss(_capture_phase_a(model, ctx, data.get(cursor + cfg.warmstart_sequences), cfg.device), False)
+    for p, f in zip(params, flags): p.requires_grad_(f)
+    opt.zero_grad(set_to_none=True)
+    if was_training: model.train()
+    out = dict(steps=cfg.relation_warmstart_steps, mass=cfg.warmstart_mass, loss_first=float(np.mean(hist[:10])) if hist else None,
+               loss_last=float(np.mean(hist[-10:])) if hist else None, target_recall_at_rho0_heldout=recall)
+    print(f"[phase A 1/2] {json.dumps(out)}")
+    return out
+
+
+@torch.no_grad()
+def recalibrate_b0(model, ctx, s, cfg: TrainConfig) -> dict:
+    """coverage control: b0 back to rho0 on one sequence -- per head where the relation has per-head thresholds.  Nothing
+    held coverage after the one calibration of 2026-09 (0.0001 .. 0.40 per layer at the end of that grid)."""
+    was_training = model.training; model.eval()
+    cap = _capture_phase_a(model, ctx, s, cfg.device); out = {}
+    for l, nm in normalizers(model).items():
+        if not isinstance(nm, MarSeaNormalizer) or l not in cap: continue
+        S, vis, K, Q = cap[l]
+        heads = _head_candidates(nm.relation, K, Q, vis, max(1, cfg.calib_subsample // max(1, S.shape[1])))
+        if nm.relation.per_head_b0:
+            nm.relation.calibrate_b0_per_head(heads, cfg.rho0)
+        else:
+            nm.relation.calibrate_b0(None, None, None, rho0=cfg.rho0, iters=30, raw=torch.cat(heads))
+        out[l] = bias_record(nm.relation.b0)
+    if was_training: model.train()
+    return out
+
+
+def st_temperature(step: int, cfg: TrainConfig) -> float:
+    if not cfg.st_anneal_steps or cfg.st_T0 == 1.0:
+        return 1.0
+    frac = min(1.0, max(0.0, (step - cfg.phase_a_steps) / cfg.st_anneal_steps))
+    return cfg.st_T0 + (1.0 - cfg.st_T0) * frac
+
+
 @torch.no_grad()
 def phase_b_init(model, ctx: MarSeaContext, data, cursor: int, cfg: TrainConfig, readme: dict):
     """calibrate b0 (bisection to rho0) and TauK's bias (median 1/std) per patched layer on `calib_sequences`
@@ -322,10 +455,13 @@ def phase_b_init(model, ctx: MarSeaContext, data, cursor: int, cfg: TrainConfig,
         if not math.isfinite(loss_live):
             raise RuntimeError("Phase-B init: non-finite live loss")
         return readme["phase_b_init"]["sanity"]
+    warm = None
+    if cfg.relation_warmstart_steps:
+        warm = relation_warmstart(model, ctx, data, cursor, cfg); model.eval()
     # sanity 5(a), first half: the SoftmaxNorm (Phase-A) path on the calibration batch
     ctx.phase_a = True; ctx.force_empty = False
     loss_pa = sum(_answer_loss(model, s, cfg.device) for s in seqs) / max(1, ntok)
-    raw_vals = {l: [] for l in norms}; stds = {l: [] for l in norms}
+    raw_vals = {l: [] for l in norms}; stds = {l: [] for l in norms}; head_vals = {l: None for l in norms}
     ctx.phase_a = False; ctx.force_empty = True; ctx.capture_inputs = True; ctx.collect = False
     loss_a = 0.0; ntok = 0
     for s in seqs:
@@ -336,10 +472,16 @@ def phase_b_init(model, ctx: MarSeaContext, data, cursor: int, cfg: TrainConfig,
             # F-6: the SAME candidate rule as RelationHead.calibrate_b0 -- visible pairs minus the D-31 sink pairs.  The
             # sequences have their own lengths (B = 1, no padding), so the pooled quantity is the 1-D value vector.
             from .relation import candidate_logits
-            vals = candidate_logits(nm.relation.raw(K.float(), Q.float()), vis)
-            if vals.numel() > cfg.calib_subsample:
-                vals = vals[torch.randint(0, vals.numel(), (cfg.calib_subsample,), device=vals.device)]
-            raw_vals[l].append(vals.cpu())
+            if nm.relation.per_head_b0:                                    # one candidate set per head, the same budget in total
+                hv = [v.cpu() for v in _head_candidates(nm.relation, K, Q, vis, max(1, cfg.calib_subsample // S.shape[1]))]
+                head_vals[l] = [hv] if head_vals[l] is None else head_vals[l] + [hv]
+                vals = torch.cat(hv)
+            else:
+                vals = candidate_logits(nm.relation.raw(K.float(), Q.float()), vis)
+                if vals.numel() > cfg.calib_subsample:
+                    vals = vals[torch.randint(0, vals.numel(), (cfg.calib_subsample,), device=vals.device)]
+                vals = vals.cpu()
+            raw_vals[l].append(vals)
             from .heads import column_stats
             st = column_stats(S, vis)[..., 3]
             stds[l].append(st[vis.expand_as(S).sum(-2) > 1].cpu())
@@ -350,10 +492,16 @@ def phase_b_init(model, ctx: MarSeaContext, data, cursor: int, cfg: TrainConfig,
         # D-31 sink pairs).  Counting sink pairs as candidates put realised coverage below rho_0 and wrote a coverage
         # number to the README that the run could not reproduce.
         vals = torch.cat(raw_vals[l]); sd = torch.cat(stds[l])
-        nm.relation.calibrate_b0(None, None, None, rho0=cfg.rho0, iters=30, raw=vals)
+        if nm.relation.per_head_b0:
+            per_head = [torch.cat([hv[h] for hv in head_vals[l]]) for h in range(len(head_vals[l][0]))]
+            nm.relation.calibrate_b0_per_head(per_head, rho0=cfg.rho0, iters=30)
+            coverage = [float((v + float(nm.relation.b0[h]) > 0).float().mean()) for h, v in enumerate(per_head)]
+        else:
+            nm.relation.calibrate_b0(None, None, None, rho0=cfg.rho0, iters=30, raw=vals)
+            coverage = float((vals + nm.relation.b0.item() > 0).float().mean())
         target = nm.tauK.calibrate(None, None, stds=sd)
         nm.tauQ.set_init_tau(1.0)
-        calib[l] = dict(b0=float(nm.relation.b0), coverage=float((vals + nm.relation.b0.item() > 0).float().mean()),
+        calib[l] = dict(b0=bias_record(nm.relation.b0), coverage=coverage,
                         n_candidates=int(vals.numel()), tauK_target=float(target),
                         tauK_bias=bias_record(nm.tauK.last_bias), tauQ_bias=bias_record(nm.tauQ.last_bias))
     ctx.capture_inputs = False
@@ -372,6 +520,8 @@ def phase_b_init(model, ctx: MarSeaContext, data, cursor: int, cfg: TrainConfig,
                   signed_rel_gap_5b=(loss_live - loss_a) / max(1e-8, abs(loss_a)),     # negative: the live relation LOWERS the loss
                   finite=math.isfinite(loss_live), coverage_live={l: float(np.mean(v)) if v else None for l, v in cov.items()})
     readme["phase_b_init"] = dict(calibration=calib, sanity=sanity)
+    if warm is not None:
+        readme["phase_b_init"]["relation_warmstart"] = warm
     print(f"[phase B init] calibration {json.dumps(calib)}\n[phase B init] sanity {json.dumps(sanity)}")
     ctx.mode = mode_saved
     if sanity["gap_5a"] > 1e-4 * max(1.0, abs(loss_pa)):                     # 5(a): E forced empty == Phase A's path (INV-9 at model level)
@@ -594,6 +744,9 @@ def train(cfg: TrainConfig, data, quick_eval=None):
     step = step0
     while step < cfg.total_steps:
         if cfg.dry_run_steps is not None and step >= step0 + cfg.dry_run_steps: break
+        for nm in normalizers(model).values():
+            if isinstance(nm, MarSeaNormalizer):
+                nm.st_temperature = st_temperature(step, cfg)             # backward only; 1.0 unless the recipe anneals it
         try:
             cursor_new, loss = train_step(model, ctx, opt, data, cursor, step, cfg, log, head_lr_scale)
         except NaNError as e:
@@ -614,11 +767,15 @@ def train(cfg: TrainConfig, data, quick_eval=None):
             continue
         cursor = cursor_new
         anneal_gate_temperature(model, step, cfg)
+        recal = None
+        if cfg.recal_every and step > cfg.phase_a_steps and (step - cfg.phase_a_steps) % cfg.recal_every == 0:
+            recal = recalibrate_b0(model, ctx, data.get(cursor), cfg)     # the NEXT sequence, read and not consumed
         if step % cfg.log_every == 0:
             e8 = e8_summary(ctx)
-            b0s = {l: float(nm.relation.b0) for l, nm in normalizers(model).items() if hasattr(nm, "relation")}
+            b0s = {l: bias_record(nm.relation.b0) for l, nm in normalizers(model).items() if hasattr(nm, "relation")}
             log(dict(step=step, loss=loss, e8=e8, head_lr_scale=head_lr_scale, grad_norms=ctx.extra_log.get("grad_norms"),
-                     nonfinite_grads=ctx.extra_log.get("nonfinite_grads"), b0=b0s))
+                     nonfinite_grads=ctx.extra_log.get("nonfinite_grads"), b0=b0s, b0_recalibrated=recal is not None,
+                     st_temperature=st_temperature(step, cfg)))
             miss = [l for l, v in e8.items() if "missing" in v]
             print(f"[B] step {step} loss {loss:.4f} "
                   + (f"rho {[round(v['rho'], 4) for v in e8.values() if 'rho' in v]}" if e8 else "")
@@ -634,6 +791,15 @@ def train(cfg: TrainConfig, data, quick_eval=None):
                 model.eval()
                 res = quick_eval(model, ctx, step); log(dict(step=step, eval=res)); print(f"[eval] step {step}: {res}")
                 model.train()
+                rr = res.get("relation_recall_row")
+                if (cfg.gate_min_relation_recall > 0 and step >= cfg.phase_a_steps + cfg.gate_after
+                        and rr is not None and not (rr >= cfg.gate_min_relation_recall)):
+                    # the 2026-09 grid printed row_recall NaN / excluded_by_stage1 1.0 from step 750 on and no gate read it
+                    readme["events"].append(dict(step=step, event="stopped: relation recall gate", relation_recall_row=rr,
+                                                 bound=cfg.gate_min_relation_recall))
+                    (run_dir / "README.json").write_text(json.dumps(readme, indent=1, default=str)); log_f.close()
+                    raise RuntimeError(f"relation recall gate: {rr} < {cfg.gate_min_relation_recall} at step {step} -- the "
+                                       "relation does not contain the gold keys at the answer rows; do not train on")
     save_checkpoint(run_dir / "final.pt", model, opt, step, cursor, cfg, extra={"head_lr_scale": head_lr_scale})
     (run_dir / "README.json").write_text(json.dumps(readme, indent=1, default=str))
     log_f.close()

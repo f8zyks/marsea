@@ -225,7 +225,8 @@ class MarSeaNormalizer(nn.Module):
                  key_only_tau: bool = False, no_nu: bool = False, key_only_relation: bool = False,
                  tau_i_pinned: bool = False, tau_j_global: bool = False, quota_mode: str = "inherited",
                  gate: str = "st", per_head: int = 0, hidden: int = 64, K_ret: Optional[int] = None,
-                 block_size: int = 512, head_block: Optional[int] = None, head_block_recompute: bool = True):
+                 block_size: int = 512, head_block: Optional[int] = None, head_block_recompute: bool = True,
+                 relation_per_head: int = 0):
         super().__init__()
         assert quota_mode in ("inherited", "uniform")
         assert gate in ("st", "hard_concrete")
@@ -243,7 +244,11 @@ class MarSeaNormalizer(nn.Module):
         self.want_dense_diag = True             # the backbone clears this when it is not collecting diagnostics
         self.want_E = True                      # E alone: E8 needs it on every LOGGING step, the dense programs do not
         self.gate_temperature = 1.0                   # annealed 1.0 -> 0.2 by the trainer for hard-concrete
-        self.relation = RelationHead(d_head, r, key_only=key_only_relation, per_head=per_head)
+        # relation_per_head = H: the RELATION alone is per Q-head (U_h, V_h, b0_h), TauK / TauQ stay shared -- the
+        # 2026-09-20 recipe.  `per_head` (E9) makes all three heads per-head and keeps a scalar b0.
+        self.relation = RelationHead(d_head, r, key_only=key_only_relation, per_head=(relation_per_head or per_head),
+                                     per_head_b0=bool(relation_per_head))
+        self.st_temperature = 1.0               # straight-through backward temperature; the trainer anneals it to 1
         self.tauK = TauK(d_head, hidden, tau_min, zero_field_inputs=key_only_tau, no_nu=no_nu, per_head=per_head)
         self.tauQ = TauQ(d_head, hidden, tau_min, per_head=per_head)
         if tau_j_global:
@@ -340,7 +345,7 @@ class MarSeaNormalizer(nn.Module):
                 g, E = hard_concrete_gate((logits > 0) & vis, logits, vis, self.gate_temperature, self.training)
             else:
                 E = (logits > 0) & vis
-                g = straight_through(E, logits, vis)
+                g = straight_through(E, logits, vis, self.st_temperature)
             # ---- STEP 1 fan-out: the inherited quota reads A_sm, NEVER S     (eq:step1)
             cbar_j = (g * A_sm).sum(-2)                                      # [B,H,n_k]   ST site (1)
             if self.quota_mode == "uniform":                                 # E9: put a predicted budget back

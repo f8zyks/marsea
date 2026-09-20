@@ -83,11 +83,17 @@ class RelationHead(nn.Module):
     """
 
     def __init__(self, d_head: int, r: int = 16, b0: float = 0.0, key_only: bool = False,
-                 per_head: int = 0):
+                 per_head: int = 0, per_head_b0: bool = False):
         super().__init__()
         self.r = r
         self.key_only = key_only
         self.per_head = per_head                       # 0 = shared; H = one (U,V) per Q-head (E9)
+        # per_head_b0 (2026-09-20 recipe): one threshold per Q-head.  With ONE b0 per layer the rho_0 calibration is met
+        # on average and by no head: at calibration layer 24's heads 0-5 (KV head 0) sat at 7-13 % and heads 6-11 at
+        # 0.06-0.6 %, and training drove them to 50-89 % against 0.01 %.  Needs per_head (U_h reads the keys of head h's
+        # KV head, V_h its queries).  The E9 `per_head` arm of 2026-09 keeps its scalar b0 (its checkpoints load).
+        self.per_head_b0 = bool(per_head_b0)
+        assert not (self.per_head_b0 and not per_head), "per_head_b0 needs per_head = H"
         if per_head:
             self.U = nn.Parameter(torch.empty(per_head, d_head, r))
             self.V = nn.Parameter(torch.empty(per_head, d_head, r))
@@ -98,7 +104,15 @@ class RelationHead(nn.Module):
             self.V = nn.Linear(d_head, r, bias=False)
             nn.init.normal_(self.U.weight, std=1.0 / math.sqrt(d_head))   # variance 1/d_head
             nn.init.normal_(self.V.weight, std=1.0 / math.sqrt(d_head))
-        self.b0 = nn.Parameter(torch.tensor(float(b0)))
+        self.b0 = nn.Parameter(torch.full((per_head,), float(b0)) if self.per_head_b0 else torch.tensor(float(b0)))
+
+    def b0_view(self, H: int, head_offset: int = 0) -> torch.Tensor:
+        """b0 broadcastable against [B, H, n_q, n_k] logits: the scalar, or the H heads from `head_offset` on."""
+        return self.b0[head_offset:head_offset + H].view(1, H, 1, 1) if self.per_head_b0 else self.b0
+
+    def b0_of(self, h: int) -> torch.Tensor:
+        """the threshold of GLOBAL Q-head h (a 0-d tensor either way)."""
+        return self.b0[h] if self.per_head_b0 else self.b0
 
     def raw(self, K_kv: torch.Tensor, Q: torch.Tensor, head_offset: int = 0) -> torch.Tensor:
         """[B,H,n_q,n_k] logits WITHOUT b0.  K_kv [B,H_kv,n_k,d] post-RoPE; Q [B,H,n_q,d].
@@ -126,7 +140,7 @@ class RelationHead(nn.Module):
     def forward(self, K_kv: torch.Tensor, Q: torch.Tensor, key_offset: int = 0, n_k_total: Optional[int] = None,
                 head_offset: int = 0) -> torch.Tensor:
         """logits with b0, and the D-31 sink mask applied (position 0 is never in a relation)."""
-        logits = self.raw(K_kv, Q, head_offset) + self.b0
+        logits = self.raw(K_kv, Q, head_offset) + self.b0_view(Q.shape[1], head_offset)
         m = sink_pair_mask(Q.shape[-2], K_kv.shape[-2], logits.device, key_offset, n_k_total)
         return logits.masked_fill(m, SINK_LOGIT)
 
@@ -139,11 +153,24 @@ class RelationHead(nn.Module):
         multi-sequence batch without recomputing.  Returns the new b0."""
         if raw is None:
             raw = self.raw(K_kv, Q)
+        if self.per_head_b0:
+            assert raw.dim() == 4, "per-head calibration needs the [B, H, n_q, n_k] logits (or calibrate_b0_per_head)"
+            return self.calibrate_b0_per_head([candidate_logits(raw[:, h:h + 1], vis) for h in range(raw.shape[1])], rho0, iters)
         vals = candidate_logits(raw, vis) if raw.dim() > 1 else raw       # pre-filtered 1-D values are accepted as-is
         if vals.numel() == 0:
             return float(self.b0)
         self.b0.fill_(bisect_b0(vals, rho0, iters))
         return float(self.b0)
+
+    @torch.no_grad()
+    def calibrate_b0_per_head(self, vals_per_head, rho0: float = 0.05, iters: int = 30) -> list:
+        """one bisection per Q-head, each over that head's own candidate logits (1-D, WITHOUT b0): every head sits at
+        rho0, not the layer on average.  A head with no candidates keeps its b0."""
+        assert self.per_head_b0 and len(vals_per_head) == self.b0.numel()
+        for h, vals in enumerate(vals_per_head):
+            if vals.numel():
+                self.b0[h] = bisect_b0(vals, rho0, iters)
+        return [float(x) for x in self.b0]
 
     @torch.no_grad()
     def coverage(self, logits: torch.Tensor, vis: torch.Tensor) -> float:
@@ -153,7 +180,9 @@ class RelationHead(nn.Module):
 
 
 def straight_through(E: torch.Tensor, logits: torch.Tensor, vis: torch.Tensor, T_st: float = T_ST) -> torch.Tensor:
-    """g: forward == E exactly (so every INV holds); backward d/dlogit = sigmoid'(logit/T)/T on vis."""
+    """g: forward == E exactly (so every INV holds); backward d/dlogit = sigmoid'(logit/T)/T on vis.
+    T_st > 1 keeps the backward alive away from the threshold (at logit -6: 0.0025 at T = 1, 0.037 at T = 4); the trainer
+    anneals MarSeaNormalizer.st_temperature to 1.  The forward never depends on it."""
     soft = torch.sigmoid(logits / T_st) * vis.to(logits.dtype)            # no gradient off vis
     return E.to(logits.dtype) + (soft - soft.detach())
 

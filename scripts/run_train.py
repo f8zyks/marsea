@@ -30,6 +30,14 @@ def main():
     ap.add_argument("--chunk", type=int, default=1024, help="the chunked path's key-chunk width (MarSeaContext.chunk)")
     ap.add_argument("--log_every", type=int, default=50, help="steps between E8 blocks / log lines")
     ap.add_argument("--eval_every", type=int, default=250); ap.add_argument("--ckpt_every", type=int, default=250)
+    # ---- the 2026-09-20 recipe (TrainConfig documents each; all off by default)
+    ap.add_argument("--relation_warmstart_steps", type=int, default=0, help="Phase A 1/2: fit the relation to the Phase-A model's high-attention pairs")
+    ap.add_argument("--warmstart_mass", type=float, default=0.10); ap.add_argument("--warmstart_lr", type=float, default=3e-3)
+    ap.add_argument("--rho0", type=float, default=0.05, help="relation coverage the b0 calibration targets (per head with relation_per_head)")
+    ap.add_argument("--recal_every", type=int, default=0, help="re-bisect b0 to rho0 every N Phase-B steps")
+    ap.add_argument("--st_T0", type=float, default=1.0); ap.add_argument("--st_anneal_steps", type=int, default=0)
+    ap.add_argument("--module_warmup_steps", type=int, default=0)
+    ap.add_argument("--gate_min_relation_recall", type=float, default=0.0); ap.add_argument("--gate_after", type=int, default=250)
     ap.add_argument("--phase_a_unpatched", action="store_true",
                     help="run Phase A on the unpatched SDPA model (cheaper; a different kernel from the one Phase B forks "
                          "into -- the delta is measured and written to the run README).  Default: patched SoftmaxNorm.")
@@ -50,7 +58,11 @@ def main():
                       dry_run_steps=args.dry_run_steps, arm_kwargs=json.loads(args.arm_kwargs), checkpoint_layers=args.checkpoint_layers,
                       head_block=(args.head_block or None), chunk=args.chunk, init_gap_policy=args.init_gap_policy, log_every=args.log_every, eval_every=args.eval_every, ckpt_every=args.ckpt_every,
                       phase_a_patched=not args.phase_a_unpatched, phase_a_ckpt=args.phase_a_ckpt, phase_a_only=args.phase_a_only,
-                      allow_phase_a_layer_change=args.allow_phase_a_layer_change)
+                      allow_phase_a_layer_change=args.allow_phase_a_layer_change,
+                      relation_warmstart_steps=args.relation_warmstart_steps, warmstart_mass=args.warmstart_mass,
+                      warmstart_lr=args.warmstart_lr, rho0=args.rho0, recal_every=args.recal_every, st_T0=args.st_T0,
+                      st_anneal_steps=args.st_anneal_steps, module_warmup_steps=args.module_warmup_steps,
+                      gate_min_relation_recall=args.gate_min_relation_recall, gate_after=args.gate_after)
     if args.layers: cfg.patched_layers = args.layers; cfg.detector_json = None
     quick = None
     if args.eval_ruler:

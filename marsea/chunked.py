@@ -59,7 +59,7 @@ def _chunk_fanout_inner(norm, q, k_kv_J, v_kv_J, vis_J, lse_m, lse_r, nu_prev_J,
     else:
         logits = norm.relation(k_kv_J, q, key_offset=j0, n_k_total=n_k_total, head_offset=head_offset)  # D-31, chunk-aware
     E = (logits > 0) & vis
-    g = straight_through(E, logits, vis)
+    g = straight_through(E, logits, vis, getattr(norm, "st_temperature", 1.0))
     # the ST gate's OFF-relation part (forward 0, backward sigmoid'): sites (3) and (4) of Sec. 4.3 read it on every
     # visible pair (cbar_i = sum_j g a1 ; A = a1 + g(tau u - a1) with u = 0 off E), so it is accumulated densely here
     st_off = (g - E.to(g.dtype)) * (~E).to(g.dtype)                              # == soft - soft.detach() off E
@@ -448,13 +448,14 @@ def _marsea_chunked_attention(norm, q, k_kv, v_kv, vis, state=None, chunk=1024, 
                     else:
                         v_b = norm.relation.V(q_b.to(u_all.dtype))               # [nb, r]
                     if norm.relation.key_only:
-                        lg_b = (u_all[b, h].sum(-1) / (norm.relation.r ** 0.5) + norm.relation.b0).to(dt).expand(nb, n_k)
+                        lg_b = (u_all[b, h].sum(-1) / (norm.relation.r ** 0.5) + norm.relation.b0_of(head_offset + h)).to(dt).expand(nb, n_k)
                     else:
                         lg_b = (torch.matmul(v_b, u_all[b, h].transpose(-1, -2)) / (norm.relation.r ** 0.5)
-                                + norm.relation.b0).to(dt)                       # [nb, n_k]; no gather
+                                + norm.relation.b0_of(head_offset + h)).to(dt)   # [nb, n_k]; no gather
                 lg_b = lg_b.masked_fill(sink_rows[ib], SINK_LOGIT)               # D-31 on the rebuilt rows
                 E_b = torch.zeros_like(vis_bk).index_put((lrow, lcol), torch.ones(lrow.numel(), dtype=torch.bool, device=dev))
-                soft_b = torch.sigmoid(lg_b / 1.0) * vis_bk.to(dt)
+                T_st = float(getattr(norm, "st_temperature", 1.0))                  # the SAME backward temperature as the fan-out's gate
+                soft_b = torch.sigmoid(lg_b / T_st) * vis_bk.to(dt)
                 st_off_b = (soft_b - soft_b.detach()) * (~E_b).to(dt)
                 # off E: A_sm with its ST term (site 2); on E: the sparse Stage-1 values.  The unit cap then runs
                 # EXACTLY as in the dense path (its gradient mixes all entries of the row).
