@@ -14,7 +14,8 @@ Here the teacher-forced pass computes exactly what prefill + frozen-prefix decod
   row t >= n_p (an answer row), triggered by its own relation E[t, .]:
       cbar_j^(t)  = cbar_j^(prefill) + sum_{n_p <= t' <= t} E[t', j] A_sm[t', j]
       members(j)  = top-K_ret scores of ( prefill members of j  U  answer rows t' <= t with E[t', j] )
-      p_tj        = row t's share of sparsemax(tau_j * members(j)),      tau_j SEALED (prefill; or at the key's arrival)
+      p_tj        = row t's share of sparsemax(tau * members(j));  tau = the SEALED tau_j (prefill; or the key's arrival),
+                    or -- trigger_tau -- heads.TauKTrigger's prediction from the column as it stands at this trigger
       Atil[t, j]  = cbar_j^(t) p_tj   on E,   A_sm[t, j] off it;   then the row programme on row t, as everywhere
   Earlier rows are never revised (their outputs stand; the KV cache above stays valid) and no row sees a later one.
 
@@ -30,7 +31,7 @@ import torch
 
 from .primitives import sparsemax_masked, proj_le_masked, _fp
 from .relation import repeat_kv, straight_through
-from .heads import column_stats, row_summary
+from .heads import column_stats, row_summary, trigger_stats
 
 NEG_PAD = -1e30
 NU_EPS = 1e-12
@@ -89,6 +90,10 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
         L_s = torch.cat([torch.cat([top0.values.masked_fill(~v0, NEG_PAD), L_s[:, :, :n_p, k0:]], -1), L_s[:, :, n_p:]], -2)
         L_v = torch.cat([torch.cat([v0, L_v[:, :, :n_p, k0:]], -1), L_v[:, :, n_p:]], -2)
         S_aT = S_a.transpose(-1, -2); E_aT = E_a.transpose(-1, -2)                  # [B,H,n,m]: the answer rows of each key
+        trig_tau = getattr(norm, "tauK_trig", None)
+        if trig_tau is not None:                                                    # the TRUE size of each relation set, row by row
+            cnt_run = torch.cat([d_p.E.sum(-2), torch.zeros(B, H, m, dtype=torch.long, device=dev)], -1).unsqueeze(-2) + torch.cumsum(E_a.long(), dim=-2)
+            k_all = repeat_kv(_fp(K_kv), g_kv)                                      # [B,H,n,d]
         p_rows = []
         for r0 in range(0, m, row_block):
             r1 = min(m, r0 + row_block); rb = r1 - r0
@@ -107,7 +112,12 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
             kk = min(K_ret, cand.shape[-1])
             top = torch.topk(cand.masked_fill(~cval, NEG_PAD), kk, dim=-1)
             tval = torch.gather(cval, -1, top.indices)
-            tau_c = torch.gather(tau_all.unsqueeze(2).expand(B, H, rb, n_k), -1, order).unsqueeze(-1)
+            if trig_tau is None:
+                tau_c = torch.gather(tau_all.unsqueeze(2).expand(B, H, rb, n_k), -1, order).unsqueeze(-1)   # sealed
+            else:                                                                   # predicted NOW, from the column as it stands
+                st = trigger_stats(top.values, tval, torch.gather(cnt_run[:, :, r0:r1], -1, order), torch.gather(S_a[:, :, r0:r1], -1, order))
+                k_act = torch.gather(k_all, 2, flat.unsqueeze(-1).expand(B, H, rb * A_max, k_all.shape[-1]))
+                tau_c = trig_tau(k_act, st.reshape(B, H, rb * A_max, 6), head_offset).reshape(B, H, rb, A_max, 1)
             p_list = sparsemax_masked(tau_c * top.values.masked_fill(~tval, 0.0), tval)
             own = (top.indices == (K_ret + t_rel).view(1, 1, rb, 1, 1)) & tval       # row t's own entry (absent: evicted -> 0)
             p_new = (p_list * own.to(dt)).sum(-1) * act.to(dt)                       # [B,H,rb,A]

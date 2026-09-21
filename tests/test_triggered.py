@@ -19,6 +19,8 @@ def _setup(T=44, n_p=30, H=(2, 3), rho=0.3, seed=0, **kw):
         norm.relation.calibrate_b0(K_kv, Q, vis, rho)
         for p_ in norm.tauK.parameters(): p_.add_(0.05 * torch.randn_like(p_))      # tau heads that actually vary
         for p_ in norm.tauQ.parameters(): p_.add_(0.05 * torch.randn_like(p_))
+        if norm.tauK_trig is not None:
+            for p_ in norm.tauK_trig.parameters(): p_.add_(0.3 * torch.randn_like(p_))   # a trigger-time tau that really varies
     return norm, Q, K_kv, S, vis, n_p
 
 
@@ -35,7 +37,8 @@ def _by_decoding(norm, Q, K_kv, S, vis, n_p, K_ret):
 
 
 @pytest.mark.parametrize("K_ret,kw", [(64, {}), (3, {}), (64, dict(relation_per_head=6, per_head=6)), (64, dict(head_block=2)),
-                                      (64, dict(tau_i_pinned=True))])
+                                      (64, dict(tau_i_pinned=True)), (64, dict(trigger_tau=True)), (3, dict(trigger_tau=True)),
+                                      (64, dict(trigger_tau=True, relation_per_head=6, per_head=6, head_block=2))])
 def test_triggered_equals_prefill_plus_decode(K_ret, kw):
     norm, Q, K_kv, S, vis, n_p = _setup(**kw)
     A_p, A_dec = _by_decoding(norm, Q, K_kv, S, vis, n_p, K_ret)
@@ -98,10 +101,13 @@ def _tiny_model(head_block=None):
     model = Qwen2ForCausalLM(cfg).double()
     ctx = MarSeaContext(mode="dense")
     torch.manual_seed(1)
-    patch_model(model, [1, 2], lambda l: make_normalizer("marsea", 8, head_block=head_block, relation_per_head=8).double(), ctx)
+    patch_model(model, [1, 2], lambda l: make_normalizer("marsea", 8, head_block=head_block, relation_per_head=8, per_head=8,
+                                                         trigger_tau=True).double(), ctx)
     with torch.no_grad():
         for l in (1, 2):
-            model.model.layers[l].self_attn.normalizer.relation.b0.fill_(0.0)     # about half of the pairs: a relation that acts
+            nm = model.model.layers[l].self_attn.normalizer
+            nm.relation.b0.fill_(0.0)                                          # about half of the pairs: a relation that acts
+            for p_ in nm.tauK_trig.parameters(): p_.add_(0.3 * torch.randn_like(p_))
     model.marsea_ctx = ctx; model.eval()
     return model, ctx
 
@@ -126,7 +132,9 @@ def test_teacher_forced_logits_equal_cached_decoding_step_by_step(hb):
         ctx.clear_generation()
     dec = torch.stack(dec, 1)                                                              # positions n_p-1 .. 39
     assert rho > 0.05, rho                                                                 # the answer rows have a live relation
-    assert float((tf[:, n_p - 1:] - dec).abs().max()) < 1e-8, float((tf[:, n_p - 1:] - dec).abs().max())
+    # 1e-7: the trigger-time tau reads a mean and a std of the member list, summed in a different order on the two paths
+    # (1.1e-8 measured with deliberately large random TauKTrigger weights; the full-sequence form is > 1e-6 away, below)
+    assert float((tf[:, n_p - 1:] - dec).abs().max()) < 1e-7, float((tf[:, n_p - 1:] - dec).abs().max())
     assert float((full[:, n_p:] - dec[:, 1:]).abs().max()) > 1e-6                          # the form trained until now is NOT what decodes
     assert float((full[:, :n_p - 1] - tf[:, :n_p - 1]).abs().max()) > 1e-9                  # nor are its prompt rows the prefill's
 
@@ -145,3 +153,32 @@ def test_n_prompt_tokens():
     from marsea.train import n_prompt_tokens
     assert n_prompt_tokens(torch.tensor([[-100, -100, -100, 5, 6, 2]])) == 3
     assert n_prompt_tokens(torch.tensor([[-100, -100]])) == 2
+
+
+# ------------------------------------------------------------------------------------------ the trigger-time temperature
+def test_trigger_stats_reads_the_true_size_and_the_triggers_standing():
+    from marsea.heads import trigger_stats
+    vals = torch.tensor([[3.0, 1.0, -1e30, -1e30], [2.0, -1e30, -1e30, -1e30]], dtype=DT); valid = vals > -1e29
+    st = trigger_stats(vals, valid, torch.tensor([7, 1]), torch.tensor([1.0, 2.0], dtype=DT))
+    assert st.shape == (2, 6)
+    assert st[0].tolist()[:4] == [7.0, 3.0, 2.0, 2.0] and abs(float(st[0, 4]) - 1.0) < 1e-6 and float(st[0, 5]) == -2.0   # size, max, gap, mean, std, s - max
+    assert st[1].tolist()[:4] == [1.0, 2.0, 0.0, 2.0] and float(st[1, 5]) == 0.0                                          # a one-member column
+
+
+def test_the_trigger_time_tau_is_used_changes_the_answer_rows_only_and_gets_gradients():
+    norm, Q, K_kv, S, vis, n_p = _setup(trigger_tau=True, relation_per_head=6, per_head=6)
+    with torch.no_grad():
+        A1, _ = norm.normalize(S, vis, K_kv, Q, State(), n_prefill=n_p)
+        saved = norm.tauK_trig; norm.tauK_trig = None
+        A0, _ = norm.normalize(S, vis, K_kv, Q, State(), n_prefill=n_p)              # the sealed tau_j
+        norm.tauK_trig = saved
+    assert float((A1[:, :, :n_p] - A0[:, :, :n_p]).abs().max()) == 0.0               # the prompt's one solve keeps TauK
+    assert float((A1[:, :, n_p:] - A0[:, :, n_p:]).abs().max()) > 1e-6
+    A, _ = norm.normalize(S, vis, K_kv, Q, State(), n_prefill=n_p)
+    A[:, :, n_p:].pow(2).sum().backward()
+    assert all(p_.grad is not None and float(p_.grad.abs().sum()) > 0 for n_, p_ in norm.tauK_trig.named_parameters() if n_ in ("w1", "w2", "b2"))
+
+
+def test_phase_b_init_starts_the_trigger_head_at_tauKs_calibrated_bias():
+    import inspect, marsea.train as tr
+    assert "nm.tauK_trig.last_bias.data.copy_(nm.tauK.last_bias.data)" in inspect.getsource(tr.phase_b_init)

@@ -82,6 +82,7 @@ class FrozenPrefixCache:
     rel_valid: Optional[torch.Tensor] = None       # [B,H,n_k,K_ret]  bool
     rel_qidx: Optional[torch.Tensor] = None        # [B,H,n_k,K_ret]  long, the query index of each stored score
     nu: Optional[torch.Tensor] = None              # [B,H,n_k]   last nu (for the next layer's TauK on new keys)
+    rel_count: Optional[torch.Tensor] = None       # [B,H,n_k]   the TRUE size of E_.j so far (the lists are truncated at K_ret)
     n_seen: int = 0                                # queries seen so far (prefix length)
     Q_hist: Optional[torch.Tensor] = None          # [B,H,T,d] post-RoPE queries (seal-at-boundary only)
     # Two different events, counted separately (review e982f83 E).  One integer used to add them, so E8's "k* near
@@ -116,6 +117,7 @@ class FrozenPrefixCache:
         self.rel_scores[..., :k] = top.values.masked_fill(~valid, NEG_PAD)
         self.rel_valid[..., :k] = valid
         self.rel_qidx[..., :k] = top.indices.masked_fill(~valid, -1)
+        self.rel_count = E.sum(-2)
         self.n_seen = n_q
         # a column whose relation exceeds K_ret loses entries to the list: the SAME event _insert_scores counts at
         # decode time, and the one the sparse prefill counts.  Without it the two prefills disagreed on a reported
@@ -160,6 +162,7 @@ class FrozenPrefixCache:
         self.rel_scores = torch.full((B, H, n_k, K), NEG_PAD, dtype=dtype, device=device)
         self.rel_valid = torch.zeros((B, H, n_k, K), dtype=torch.bool, device=device)
         self.rel_qidx = torch.full((B, H, n_k, K), -1, dtype=torch.long, device=device)
+        self.rel_count = torch.zeros((B, H, n_k), dtype=torch.long, device=device)
         bhi, jj, S_s = sp["bhi"], sp["j"], sp["S"]
         if jj.numel():
             col = (bhi[:, 0] * H + bhi[:, 1]) * n_k + jj                       # flat column id per relation entry
@@ -184,6 +187,7 @@ class FrozenPrefixCache:
             self.rel_valid = flat_v.reshape(B, H, n_k, K)
             self.rel_qidx = flat_q.reshape(B, H, n_k, K)
             self.eviction_events += int((counts > K).sum())
+            self.rel_count = counts.reshape(B, H, n_k)
         self.n_seen = n_q
         if torch.is_tensor(seed.get("kstar")):
             self.near_truncation_events += int((seed["kstar"] >= 0.9 * K).sum())
@@ -196,6 +200,8 @@ class FrozenPrefixCache:
         self.tau_j = torch.cat([self.tau_j, tau_new], -1)
         self.cbar_j = torch.cat([self.cbar_j, cbar_new], -1)
         self.nu = torch.cat([self.nu, nu_new], -1)
+        if self.rel_count is not None:
+            self.rel_count = torch.cat([self.rel_count, torch.zeros((B, H, 1), dtype=self.rel_count.dtype, device=dev)], -1)
         self.rel_scores = torch.cat([self.rel_scores, torch.full((B, H, 1, K), NEG_PAD, dtype=self.rel_scores.dtype, device=dev)], -2)
         self.rel_valid = torch.cat([self.rel_valid, torch.zeros((B, H, 1, K), dtype=torch.bool, device=dev)], -2)
         self.rel_qidx = torch.cat([self.rel_qidx, torch.full((B, H, 1, K), -1, dtype=torch.long, device=dev)], -2)
@@ -253,7 +259,15 @@ def decode_step(norm: MarSeaNormalizer, cache: FrozenPrefixCache, S_row: torch.T
     s_j = S32[..., 0, :].masked_fill(~vis[..., 0, :], 0.0)
     cache.cbar_j = cache.cbar_j + E_j.to(S32.dtype) * A_sm[..., 0, :]
     cache._insert_scores(s_j, E_j, t)
-    z = cache.tau_j.unsqueeze(-1) * cache.rel_scores.masked_fill(~cache.rel_valid, 0.0)
+    if cache.rel_count is not None:
+        cache.rel_count = cache.rel_count + E_j.long()
+    tau_use = cache.tau_j
+    if getattr(norm, "tauK_trig", None) is not None:
+        # the trigger-time temperature: predicted from the column as it stands now, for the columns row t triggers
+        from .heads import trigger_stats
+        st = trigger_stats(cache.rel_scores, cache.rel_valid, cache.rel_count, s_j)
+        tau_use = torch.where(E_j, norm.tauK_trig(repeat_kv(_fp(K_kv), g_kv), st), cache.tau_j)
+    z = tau_use.unsqueeze(-1) * cache.rel_scores.masked_fill(~cache.rel_valid, 0.0)
     p_list = sparsemax_masked(z, cache.rel_valid)                                # [B,H,n_k,K]
     is_new = (cache.rel_qidx == t) & cache.rel_valid
     p_new = (p_list * is_new.to(p_list.dtype)).sum(-1)                           # 0 if evicted / not in relation

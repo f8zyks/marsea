@@ -226,7 +226,7 @@ class MarSeaNormalizer(nn.Module):
                  tau_i_pinned: bool = False, tau_j_global: bool = False, quota_mode: str = "inherited",
                  gate: str = "st", per_head: int = 0, hidden: int = 64, K_ret: Optional[int] = None,
                  block_size: int = 512, head_block: Optional[int] = None, head_block_recompute: bool = True,
-                 relation_per_head: int = 0):
+                 relation_per_head: int = 0, trigger_tau: bool = False):
         super().__init__()
         assert quota_mode in ("inherited", "uniform")
         assert gate in ("st", "hard_concrete")
@@ -248,6 +248,10 @@ class MarSeaNormalizer(nn.Module):
         # 2026-09-20 recipe.  `per_head` (E9) makes all three heads per-head and keeps a scalar b0.
         self.relation = RelationHead(d_head, r, key_only=key_only_relation, per_head=(relation_per_head or per_head),
                                      per_head_b0=bool(relation_per_head))
+        # trigger_tau: the column temperature of a TRIGGERED solve is predicted then, from the column as it stands
+        # (heads.TauKTrigger).  Read by marsea/triggered.py and causal.decode_step; the prompt's one solve keeps TauK.
+        from .heads import TauKTrigger
+        self.tauK_trig = TauKTrigger(d_head, hidden, tau_min, per_head=per_head) if trigger_tau else None
         self.st_temperature = 1.0               # straight-through backward temperature; the trainer anneals it to 1
         self.tauK = TauK(d_head, hidden, tau_min, zero_field_inputs=key_only_tau, no_nu=no_nu, per_head=per_head)
         self.tauQ = TauQ(d_head, hidden, tau_min, per_head=per_head)

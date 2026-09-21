@@ -166,6 +166,46 @@ class TauK(_Head):
         return target
 
 
+def trigger_stats(vals: torch.Tensor, valid: torch.Tensor, count: torch.Tensor, s_trig: torch.Tensor) -> torch.Tensor:
+    """-> [..., 6]: what a column looks like at the moment a row triggers it.  vals / valid [..., K]: the column's member
+    list (its top-K_ret relation scores, the triggering row's own among them if it made the list); count [...]: the TRUE
+    size of the relation set so far (the list is truncated, the size is not); s_trig [...]: the triggering row's score.
+      (size, max, max - second, mean, std, s_trig - max)
+    One function for the teacher-forced form and for decode_step, so the two cannot disagree on a feature."""
+    v = _fp(vals); m = valid.bool()
+    n = m.sum(-1).to(v.dtype)
+    neg = v.masked_fill(~m, float("-inf"))
+    vmax = torch.where(n > 0, neg.amax(-1), torch.zeros_like(n))
+    if v.shape[-1] > 1:
+        second = torch.where(n > 1, neg.topk(2, dim=-1).values[..., 1], vmax)
+    else:
+        second = vmax
+    v0 = v.masked_fill(~m, 0.0)
+    mean = v0.sum(-1) / n.clamp_min(1.0)
+    var = (((v0 - mean.unsqueeze(-1)) ** 2) * m.to(v.dtype)).sum(-1) / n.clamp_min(1.0)
+    std = (var + 1e-8).sqrt()
+    return torch.stack([_fp(count), vmax, vmax - second, mean, std, _fp(s_trig) - vmax], dim=-1)
+
+
+class TauKTrigger(_Head):
+    """tau for ONE solve of a column, predicted when a row triggers it (owner's decision, 2026-09-21):
+        tau_tj = tau_min + softplus(MLP(LN(k_j), f(trigger_stats)))
+    TauK's tau_j is sealed at prefill from the PROMPT rows' column statistics: it cannot know how many members the
+    column has when a later row arrives, nor where that row stands among them -- and that gap decides whether the row is
+    starved (score more than ~1/tau below the members: an exact zero) or over-paid (top score: most of a quota the
+    earlier rows also paid into; relation mass 1-4 at the answer rows in the 2026-09-20 pilots).  Everything it reads
+    exists at trigger time, so nothing leaks.  The price is prop:prefix's hypothesis (psi_j monotone at SEALED tau_j):
+    exclusion is no longer permanent inside the programme -- each row's EMITTED output still is (no row is revised)."""
+
+    def __init__(self, d_head: int, hidden: int = 64, tau_min: float = TAU_MIN, init_tau: float = 1.0, per_head: int = 0):
+        super().__init__(d_head, 6, hidden, tau_min, init_tau, per_head)
+
+    def forward(self, k_vec: torch.Tensor, stats: torch.Tensor, head_offset: int = 0) -> torch.Tensor:
+        """k_vec [B,H,N,d] the triggered columns' keys (expanded to Q-heads); stats [B,H,N,6] -> tau [B,H,N]."""
+        x = torch.cat([self.ln(_fp(k_vec)), feat(_fp(stats))], dim=-1)
+        return self.tau_min + F.softplus(self._mlp(x, head_offset))
+
+
 class TauQ(_Head):
     """tau_i = tau_min + softplus(MLP(LN(q_i), f(row_summary_i))).  Init tau_i = 1: the identity on step 1's row."""
 

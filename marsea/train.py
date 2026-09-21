@@ -508,6 +508,8 @@ def phase_b_init(model, ctx: MarSeaContext, data, cursor: int, cfg: TrainConfig,
             coverage = float((vals + nm.relation.b0.item() > 0).float().mean())
         target = nm.tauK.calibrate(None, None, stds=sd)
         nm.tauQ.set_init_tau(1.0)
+        if getattr(nm, "tauK_trig", None) is not None:                 # the trigger-time head starts where TauK was calibrated
+            nm.tauK_trig.last_bias.data.copy_(nm.tauK.last_bias.data)
         calib[l] = dict(b0=bias_record(nm.relation.b0), coverage=coverage,
                         n_candidates=int(vals.numel()), tauK_target=(target if isinstance(target, list) else float(target)),
                         tauK_bias=bias_record(nm.tauK.last_bias), tauQ_bias=bias_record(nm.tauQ.last_bias))
