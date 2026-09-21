@@ -35,6 +35,8 @@ def test_monitor_records_are_consistent_with_the_diagnostics(triggered):
         assert r["src_in_support"] in (0.0, 1.0) and (r["src_mass_final"] > 0) == bool(r["src_in_support"])
         if r["src_in_relation"]:
             assert r["col_size"] >= 1 and r["row_standing"] <= 1e-12          # the row is a member: at or below the column's max
+        else:
+            assert math.isnan(r["row_standing"]) and math.isnan(r["tau_used"]) and math.isnan(r["row_share_p"])
         assert abs(r["relation_mass_final"] + r["tail_mass_final"] - (r["relation_mass_final"] + r["tail_mass_final"])) < 1e-12
     if triggered:                                                              # the per-solve tau is reported for triggered rows
         assert any(r["tau_used"] != r["tau_sealed"] for r in recs if r["src_in_relation"])

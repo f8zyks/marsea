@@ -85,7 +85,7 @@ def monitor_example(model, ctx, ex, l_star: int, h_star: int, device="cuda") -> 
                    src_rank_final=float((A[r][vis] > A[r, j]).sum()),
                    relation_size=float(nE), relation_kept_frac=float(((A[r] > 0) & Er).sum() / max(1, nE)),
                    relation_mass_softmax=rel_sm, relation_mass_Atil=rel_til, relation_mass_final=rel_fin,
-                   overpay_ratio=(rel_til / rel_sm) if rel_sm > 1e-9 else float("nan"),
+                   overpay_ratio=float("nan"),                               # a ratio of MEANS, filled in by summarise()
                    cap_binds=float(d.cap_binds[0, hh, r]), tail_kept_frac=float(((A[r] > 0) & off).sum() / max(1, int(off.sum()))),
                    tail_mass_softmax=float(Asm[r][off].sum()), tail_mass_final=float(A[r][off].sum()),
                    support_size=float(((A[r] > 0) & vis).sum()), tau_i=float(d.tau_i[0, hh, r]),
@@ -96,12 +96,13 @@ def monitor_example(model, ctx, ex, l_star: int, h_star: int, device="cuda") -> 
         nm = int(mem.sum()); sc = S[:, j][mem]
         cmx, cgap, cmean, cstd = _stats(sc)
         mine = sorted(value_rows.get(v, ()))
-        rec.update(col_size=float(nm), col_answer_members=float((mem & (ar >= n_p)).sum()),
-                   col_precision=(float(sum(1 for q in mine if q <= r and bool(mem[q]))) / nm) if nm else float("nan"),
-                   row_share_p=float(p[r, j]), tau_sealed=float(d.tau_j[0, hh, j]),
-                   tau_used=float(tau_trig[r - n_p, j]) if (tau_trig is not None and r >= n_p) else float(d.tau_j[0, hh, j]),
+        member = bool(Er[j]); nan = float("nan")                                 # the column readings that describe THIS row's solve
+        rec.update(col_size=float(nm), col_answer_members=float((mem & (ar >= n_p)).sum()),                # exist only if it is a member
+                   col_precision=(float(sum(1 for q in mine if q <= r and bool(mem[q]))) / nm) if nm else nan,
+                   row_share_p=float(p[r, j]) if member else nan, tau_sealed=float(d.tau_j[0, hh, j]),
+                   tau_used=(float(tau_trig[r - n_p, j]) if (tau_trig is not None and r >= n_p) else float(d.tau_j[0, hh, j])) if member else nan,
                    col_quota=float(d.cbar_j[0, hh, j]), col_score_max=cmx, col_score_gap=cgap, col_score_mean=cmean, col_score_std=cstd,
-                   row_standing=(float(S[r, j]) - cmx) if nm else float("nan"))
+                   row_standing=(float(S[r, j]) - cmx) if member else nan)
         recs.append(rec)
     return recs
 
@@ -113,6 +114,8 @@ def summarise(recs: list) -> dict:
         for key in ROW_KEYS + COL_KEYS:
             vals = [r[key] for r in rows if key in r and r[key] is not None and not (isinstance(r[key], float) and math.isnan(r[key]))]
             out[key] = float(np.mean(vals)) if vals else None
+        if out.get("relation_mass_softmax"):                                     # per-row ratios explode where softmax put ~0 on the relation
+            out["overpay_ratio"] = out["relation_mass_Atil"] / out["relation_mass_softmax"]
         return out
     if not recs:
         return dict(n=0)
@@ -139,7 +142,7 @@ def format_line(step, res: dict) -> str:
         return f"[monitor] step {step}: no rows"
     f = lambda v, nd=3: "-" if v is None else f"{v:.{nd}f}"
     parts = []
-    for name, a in [("all", res["all"])] + [(f"m={m}", a) for m, a in res["by_m"].items()]:
+    for name, a in [("all", res["all"]), ("first tok", res["first_token"])] + [(f"m={m}", a) for m, a in res["by_m"].items()]:
         parts.append(f"{name}: src in E {f(a['src_in_relation'], 2)} in supp {f(a['src_in_support'], 2)} mass {f(a['src_mass_softmax'], 2)}>{f(a['src_mass_final'], 2)} "
                      f"| |E_i| {f(a['relation_size'], 0)} overpay x{f(a['overpay_ratio'], 2)} cap {f(a['cap_binds'], 2)} tail kept {f(a['tail_kept_frac'], 2)} "
                      f"| col size {f(a['col_size'], 0)} share {f(a['row_share_p'], 2)} tau {f(a['tau_used'], 2)} standing {f(a['row_standing'], 2)}")
