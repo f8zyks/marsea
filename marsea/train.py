@@ -81,6 +81,7 @@ class TrainConfig:
                                                # (marsea/triggered.py); dense path only so far
     gate_min_relation_recall: float = 0.0      # quick eval: stop if the relation's recall of the gold keys at the
     gate_after: int = 250                      #   answer rows is below this, this many Phase-B steps in (0 = no gate)
+    monitor_every: int = 0                     # the relation monitor (marsea/monitor.py) every N Phase-B steps
     allow_phase_a_layer_change: bool = False   # fork a Phase-A file saved under a different PATCHED_LAYERS (after S0)
     phase_a_patched: bool = True               # Phase A runs the PATCHED SoftmaxNorm layers, i.e. exactly the forward
                                                # Phase B forks into (B0 is Phase A continued, so S2 pays this memory
@@ -656,8 +657,8 @@ def _answer_loss(model, s, device) -> float:
 
 
 # --------------------------------------------------------------------------- the loop
-def train(cfg: TrainConfig, data, quick_eval=None):
-    """data: a MixedDataset (data.get(cursor) -> Sequence).  quick_eval: callable(model, ctx, step) -> dict."""
+def train(cfg: TrainConfig, data, quick_eval=None, monitor=None):
+    """data: a MixedDataset (data.get(cursor) -> Sequence).  quick_eval, monitor: callable(model, ctx, step) -> dict."""
     set_seed(cfg.seed)
     out = pathlib.Path(cfg.out_dir); out.mkdir(parents=True, exist_ok=True)
     run_dir = out / f"{cfg.arm}_seed{cfg.seed}"; run_dir.mkdir(exist_ok=True)
@@ -786,6 +787,10 @@ def train(cfg: TrainConfig, data, quick_eval=None):
             continue
         cursor = cursor_new
         anneal_gate_temperature(model, step, cfg)
+        if monitor is not None and cfg.monitor_every and (step - cfg.phase_a_steps) % cfg.monitor_every == 0:
+            from .monitor import format_line
+            model.eval(); mres = monitor(model, ctx, step); model.train()
+            log(dict(step=step, monitor=mres)); print(format_line(step, mres))
         recal = None
         if cfg.recal_every and step > cfg.phase_a_steps and (step - cfg.phase_a_steps) % cfg.recal_every == 0:
             recal = recalibrate_b0(model, ctx, data.get(cursor), cfg)     # the NEXT sequence, read and not consumed

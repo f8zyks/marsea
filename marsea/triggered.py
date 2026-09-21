@@ -94,13 +94,13 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
         if trig_tau is not None:                                                    # the TRUE size of each relation set, row by row
             cnt_run = torch.cat([d_p.E.sum(-2), torch.zeros(B, H, m, dtype=torch.long, device=dev)], -1).unsqueeze(-2) + torch.cumsum(E_a.long(), dim=-2)
             k_all = repeat_kv(_fp(K_kv), g_kv)                                      # [B,H,n,d]
-        p_rows = []
+        p_rows = []; tau_rows = []
         for r0 in range(0, m, row_block):
             r1 = min(m, r0 + row_block); rb = r1 - r0
             E_blk = E_a[:, :, r0:r1]                                                # [B,H,rb,n]
             A_max = int(E_blk.sum(-1).max())
             if A_max == 0:
-                p_rows.append(torch.zeros(B, H, rb, n_k, dtype=dt, device=dev)); continue
+                p_rows.append(torch.zeros(B, H, rb, n_k, dtype=dt, device=dev)); tau_rows.append(torch.zeros(B, H, rb, n_k, dtype=dt, device=dev)); continue
             order = torch.argsort(E_blk.to(torch.int8), dim=-1, descending=True, stable=True)[..., :A_max]   # the active columns first
             act = torch.gather(E_blk, -1, order)                                    # [B,H,rb,A]
             flat = order.reshape(B, H, rb * A_max)
@@ -122,6 +122,7 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
             own = (top.indices == (K_ret + t_rel).view(1, 1, rb, 1, 1)) & tval       # row t's own entry (absent: evicted -> 0)
             p_new = (p_list * own.to(dt)).sum(-1) * act.to(dt)                       # [B,H,rb,A]
             p_rows.append(torch.zeros(B, H, rb, n_k, dtype=dt, device=dev).scatter(-1, order, p_new))
+            tau_rows.append(torch.zeros(B, H, rb, n_k, dtype=dt, device=dev).scatter(-1, order, (tau_c.squeeze(-1) * act.to(dt)).detach()))
         p_a = torch.cat(p_rows, -2)                                                 # [B,H,m,n]; 0 off E
         Atil_a = A_sm_a + g_a * (cbar_run * p_a - A_sm_a)                           # ST site 2
         # ---- the row programme, row-local: identical to the dense form's
@@ -157,4 +158,5 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
                            cap_theta=cat1(d_p.cap_theta, cap_theta_a), p=rows(d_p.p, p_a), a1=rows(d_p.a1, a1_a),
                            Atil=rows(d_p.Atil, Atil_a), A_sm=rows(d_p.A_sm, A_sm_a), c=None, u=rows(d_p.u, u_a), A=A)
         diag.extra["triggered"] = dict(n_prefill=n_p, K_ret=K_ret)
+        diag.extra["tau_trig_rows"] = torch.cat(tau_rows, -2)                       # [B,H,m,n]: the tau of each triggered solve (monitor)
     return A.to(out_dtype), diag

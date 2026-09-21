@@ -37,6 +37,8 @@ def main():
     ap.add_argument("--recal_every", type=int, default=0, help="re-bisect b0 to rho0 every N Phase-B steps")
     ap.add_argument("--st_T0", type=float, default=1.0); ap.add_argument("--st_anneal_steps", type=int, default=0)
     ap.add_argument("--module_warmup_steps", type=int, default=0)
+    ap.add_argument("--monitor_every", type=int, default=0, help="the relation monitor every N Phase-B steps (needs --eval_ruler)")
+    ap.add_argument("--monitor_n", type=int, default=2, help="examples per --eval_ruler file the monitor reads")
     ap.add_argument("--triggered", action="store_true", help="train the TRIGGERED teacher-forced form (= prefill + decode; marsea/triggered.py); needs --mode dense")
     ap.add_argument("--gate_min_relation_recall", type=float, default=0.0); ap.add_argument("--gate_after", type=int, default=250)
     ap.add_argument("--phase_a_unpatched", action="store_true",
@@ -63,9 +65,9 @@ def main():
                       relation_warmstart_steps=args.relation_warmstart_steps, warmstart_mass=args.warmstart_mass,
                       warmstart_lr=args.warmstart_lr, rho0=args.rho0, recal_every=args.recal_every, st_T0=args.st_T0,
                       st_anneal_steps=args.st_anneal_steps, module_warmup_steps=args.module_warmup_steps,
-                      gate_min_relation_recall=args.gate_min_relation_recall, gate_after=args.gate_after, triggered=args.triggered)
+                      gate_min_relation_recall=args.gate_min_relation_recall, gate_after=args.gate_after, triggered=args.triggered, monitor_every=args.monitor_every)
     if args.layers: cfg.patched_layers = args.layers; cfg.detector_json = None
-    quick = None
+    quick = None; monitor = None
     if args.eval_ruler:
         det = json.load(open(args.detector)) if pathlib.Path(args.detector).exists() else None
         layers = det["patched_layers"] if det else cfg.patched_layers
@@ -77,7 +79,11 @@ def main():
             raise FileNotFoundError(f"--eval_ruler {args.eval_ruler} matches no file")
         exs = [build_example(r, tok) for f in eval_files for r in load_jsonl(f)]
         quick = quick_eval_factory(exs, [], tok, l_star, h_star, args.arm)
-    train(cfg, data, quick_eval=quick)
+        if args.monitor_every:
+            from marsea.monitor import monitor_factory
+            mon = [build_example(r, tok) for f in eval_files for r in load_jsonl(f)[:args.monitor_n]]
+            monitor = monitor_factory(mon, l_star, h_star)
+    train(cfg, data, quick_eval=quick, monitor=monitor)
 
 
 if __name__ == "__main__":

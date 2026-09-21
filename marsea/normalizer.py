@@ -339,6 +339,8 @@ class MarSeaNormalizer(nn.Module):
             if all(torch.is_tensor(v) for v in vals):
                 setattr(merged, name, torch.cat(vals, dim=1))
         merged.extra["head_block"] = self.head_block
+        if self.want_dense_diag and all("tau_trig_rows" in d.extra for d in diags):      # the triggered form's per-solve tau (monitor)
+            merged.extra["tau_trig_rows"] = torch.cat([d.extra["tau_trig_rows"] for d in diags], dim=1)
         return A, merged
 
     def _normalize_one(self, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Tensor, Q: torch.Tensor,
