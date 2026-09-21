@@ -104,7 +104,7 @@ def test_warmstart_targets_are_high_mass_pairs_without_the_sink_column():
 
 def test_quick_eval_reports_the_relation_at_the_answer_rows(monkeypatch):
     import marsea.evaluate as ev
-    rows = [dict(tf_loss=0.1, exact_set=True, e8={}, attention=dict(rows=[dict(rel_recall=1.0, E_size=40, Rtil=0.6, supp_rel=3),
+    rows = [dict(tf_loss=0.1, exact_set=True, ruler_recall=0.75, m=4, e8={}, attention=dict(rows=[dict(rel_recall=1.0, E_size=40, Rtil=0.6, supp_rel=3),
                                                                         dict(rel_recall=0.0, E_size=0, Rtil=0.0, supp_rel=0)]))]
     monkeypatch.setattr(ev, "evaluate_ruler", lambda *a, **k: rows)
     monkeypatch.setattr(ev, "aggregate_ruler", lambda r, stratify=None: {None: dict(interval_hit_rate=None, row_precision=1.0, row_recall=None,
@@ -112,6 +112,7 @@ def test_quick_eval_reports_the_relation_at_the_answer_rows(monkeypatch):
     res = ev.quick_eval_factory([object()], [], None, 23, 2, "marsea")(None, None, 750)
     assert res["relation_recall_row"] == 0.5 and res["relation_size_row"] == 20 and res["relation_mass_row"] == 0.3
     assert res["relation_support_nonempty"] == 0.5
+    assert res["ruler_recall"] == 0.75 and res["ruler_recall_by_m"] == {"4": 0.75}
 
 
 def test_per_head_tau_heads_with_the_per_head_relation_and_their_per_head_calibration():

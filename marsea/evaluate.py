@@ -597,11 +597,19 @@ def quick_eval_factory(examples_ruler: list, examples_qa: list, tok, l_star: int
     exact-set accuracy by greedy generation on n_gen RULER examples."""
     def quick_eval(model, ctx, step):
         rows = evaluate_ruler(model, tok, ctx, examples_ruler, l_star, h_star, arm, modes=("teacher",), device=device)
-        gen = evaluate_ruler(model, tok, ctx, examples_ruler[:n_gen], l_star, h_star, arm, modes=("generation",), device=device)
+        # 160 new tokens, not the evaluation queue's 32: 32 hold three values, so exact-set was impossible for every m >= 4
+        # example and read 0.50 in every pilot whatever the model did (2026-09-21).  A diagnostic; the queue keeps the spec's 32.
+        gen = evaluate_ruler(model, tok, ctx, examples_ruler[:n_gen], l_star, h_star, arm, modes=("generation",), device=device,
+                             max_new_tokens=160)
         agg = aggregate_ruler(rows, stratify=None)[None]
         res = dict(tf_loss=float(np.mean([r["tf_loss"] for r in rows])), exact_set_acc=float(np.mean([r["exact_set"] for r in gen])) if gen else None,
                    interval_hit_rate=agg["interval_hit_rate"], row_precision=agg["row_precision"], row_recall=agg["row_recall"],
                    excluded_by_stage1=agg["excluded_by_stage1"], rejected_by_row=agg["rejected_by_row"])
+        if gen:
+            res["ruler_recall"] = float(np.mean([r["ruler_recall"] for r in gen]))
+            by_m = {}
+            for r in gen: by_m.setdefault(int(r["m"]), []).append(r["ruler_recall"])
+            res["ruler_recall_by_m"] = {str(k): float(np.mean(v)) for k, v in sorted(by_m.items())}
         # the relation at the answer rows of (l*, h*): does it CONTAIN the gold keys, how large is it, how much mass does it
         # carry.  The 2026-09 grid had recall 0.000, size ~2 and mass ~1e-9 from its first quick eval, and nothing read it
         # (row_precision read 0.9+ there: precision is 1 on an empty support).  train()'s relation-recall gate reads this.
