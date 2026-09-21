@@ -1,0 +1,150 @@
+"""
+The TRIGGERED (causal) teacher-forced form of the normaliser (owner's decision, 2026-09-20).
+
+The full-sequence form solves each column programme ONCE over every row of the sequence.  Under teacher forcing that
+couples an answer row to LATER answer rows -- whose queries encode the gold tokens -- through four channels (the column's
+member set, the inherited quota cbar_j, the column sparsemax, TauK's column statistics and nu), and it lets the answer
+rows change the prompt rows' programmes.  Decoding (spec Sec. 6.4) cannot do either: the prompt is prefilled alone, and
+at step t a column is re-solved over the members that exist then.  So the function that was trained is not the function
+that generates, and the training form leaks.
+
+Here the teacher-forced pass computes exactly what prefill + frozen-prefix decoding computes:
+
+  rows < n_p  (the prompt)   the ordinary programmes, over the prompt rows and keys only  == the generation prefill
+  row t >= n_p (an answer row), triggered by its own relation E[t, .]:
+      cbar_j^(t)  = cbar_j^(prefill) + sum_{n_p <= t' <= t} E[t', j] A_sm[t', j]
+      members(j)  = top-K_ret scores of ( prefill members of j  U  answer rows t' <= t with E[t', j] )
+      p_tj        = row t's share of sparsemax(tau_j * members(j)),      tau_j SEALED (prefill; or at the key's arrival)
+      Atil[t, j]  = cbar_j^(t) p_tj   on E,   A_sm[t, j] off it;   then the row programme on row t, as everywhere
+  Earlier rows are never revised (their outputs stand; the KV cache above stays valid) and no row sees a later one.
+
+`causal.decode_step` is the reference: tests/test_triggered.py drives it row by row and requires the same A.  All answer
+rows are computed at once -- a sequentially truncated top-K list equals the top-K of the union, so row t's list is a
+masked top-K over (prefill list || answer rows <= t) -- in blocks of rows to bound the [rows, active columns, K + m]
+candidate tensor.  Gradients flow through every site the dense form has (the four straight-through sites, tau_j,
+tau_i, the members' scores and the prefill quota).
+"""
+from __future__ import annotations
+from typing import Optional
+import torch
+
+from .primitives import sparsemax_masked, proj_le_masked, _fp
+from .relation import repeat_kv, straight_through
+from .heads import column_stats, row_summary
+
+NEG_PAD = -1e30
+NU_EPS = 1e-12
+
+
+def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Tensor, Q: torch.Tensor, state, n_prefill: int,
+                        K_ret: int = 64, head_offset: int = 0, row_block: int = 32, logits_override: Optional[torch.Tensor] = None,
+                        **kw):
+    """S [B,H,n,n] scaled scores (square: a full teacher-forced pass), rows/keys < n_prefill are the prompt.
+    Returns (A [B,H,n,n], Diagnostics) like MarSeaNormalizer._normalize_one."""
+    from .normalizer import Diagnostics, State, broadcast_vis, row_softmax, row_masses, unit_cap
+    assert not kw, f"the triggered form does not take {sorted(kw)}"
+    assert norm.quota_mode == "inherited" and abs(norm.alpha - 2.0) < 1e-12 and norm.gate == "st", \
+        "the triggered form implements the main arm (inherited quota, sparsemax, straight-through gate)"
+    B, H, n_q, n_k = S.shape
+    assert n_q == n_k, "the triggered form is a full teacher-forced pass (prefill and decode have their own paths)"
+    n_p, m = int(n_prefill), n_q - int(n_prefill)
+    assert 0 < n_p < n_q
+    out_dtype = S.dtype
+    visb = broadcast_vis(vis, S).expand(B, H, n_q, n_k)
+    g_kv = H // K_kv.shape[1]
+    # ---- the prompt: exactly the generation prefill
+    nu_prev = state.nu_prev if (state is not None and state.nu_prev is not None) else None
+    st_p = State(nu_prev=None if nu_prev is None else nu_prev[..., :n_p])
+    A_p, d_p = norm._normalize_one(S[:, :, :n_p, :n_p], visb[:, :, :n_p, :n_p], K_kv[:, :, :n_p], Q[:, :, :n_p], st_p,
+                                   logits_override=logits_override, head_offset=head_offset)
+    with torch.autocast(device_type=S.device.type, enabled=False):
+        S32 = _fp(S).masked_fill(~visb, float("-inf"))
+        dt, dev = S32.dtype, S.device
+        S_a = S32[:, :, n_p:, :]; vis_a = visb[:, :, n_p:, :]                       # [B,H,m,n]
+        A_sm_a = row_softmax(S_a, vis_a)
+        if logits_override is not None:
+            logits_a = _fp(logits_override).expand(B, H, m, n_k)
+        else:
+            logits_a = norm.relation(K_kv, Q[:, :, n_p:], key_offset=0, n_k_total=n_k, head_offset=head_offset)
+        E_a = (logits_a > 0) & vis_a
+        g_a = straight_through(E_a, logits_a, vis_a, norm.st_temperature)
+        # ---- tau_j: sealed at prefill for the prompt keys; an answer key is sealed at its arrival, from its one visible
+        # entry S[t, t] and nu_prev = 1 (a one-member column has p = 1), as decode_step does
+        diag_s = torch.diagonal(S32[:, :, n_p:, n_p:], dim1=-2, dim2=-1)           # [B,H,m]
+        if norm.tau_j_global:
+            tau_new = (norm.tau_min + torch.nn.functional.softplus(norm.tau_j_raw)).expand(B, H, m)
+        else:
+            stats_new = column_stats(diag_s.unsqueeze(-2), torch.ones(B, H, 1, m, dtype=torch.bool, device=dev))
+            tau_new = norm.tauK(repeat_kv(_fp(K_kv[:, :, n_p:]), g_kv), stats_new, torch.ones(B, H, m, dtype=dt, device=dev), head_offset)
+        tau_all = torch.cat([d_p.tau_j, tau_new], -1)                               # [B,H,n]
+        # ---- the inherited quota, grown row by row (ST site 1)
+        zeros_m = torch.zeros(B, H, m, dtype=dt, device=dev)
+        cbar_run = torch.cat([d_p.cbar_j, zeros_m], -1).unsqueeze(-2) + torch.cumsum(g_a * A_sm_a, dim=-2)   # [B,H,m,n]
+        # ---- each column's prefill list: its top-K_ret relation scores (what FrozenPrefixCache.init_from_prefill keeps)
+        S_p = S32[:, :, :n_p, :n_p]
+        k0 = min(K_ret, n_p)
+        top0 = torch.topk(S_p.masked_fill(~d_p.E, NEG_PAD).transpose(-1, -2), k0, dim=-1)       # over the queries of each key
+        v0 = torch.gather(d_p.E.transpose(-1, -2), -1, top0.indices)
+        L_s = torch.full((B, H, n_k, K_ret), NEG_PAD, dtype=dt, device=dev); L_v = torch.zeros((B, H, n_k, K_ret), dtype=torch.bool, device=dev)
+        L_s = torch.cat([torch.cat([top0.values.masked_fill(~v0, NEG_PAD), L_s[:, :, :n_p, k0:]], -1), L_s[:, :, n_p:]], -2)
+        L_v = torch.cat([torch.cat([v0, L_v[:, :, :n_p, k0:]], -1), L_v[:, :, n_p:]], -2)
+        S_aT = S_a.transpose(-1, -2); E_aT = E_a.transpose(-1, -2)                  # [B,H,n,m]: the answer rows of each key
+        p_rows = []
+        for r0 in range(0, m, row_block):
+            r1 = min(m, r0 + row_block); rb = r1 - r0
+            E_blk = E_a[:, :, r0:r1]                                                # [B,H,rb,n]
+            A_max = int(E_blk.sum(-1).max())
+            if A_max == 0:
+                p_rows.append(torch.zeros(B, H, rb, n_k, dtype=dt, device=dev)); continue
+            order = torch.argsort(E_blk.to(torch.int8), dim=-1, descending=True, stable=True)[..., :A_max]   # the active columns first
+            act = torch.gather(E_blk, -1, order)                                    # [B,H,rb,A]
+            flat = order.reshape(B, H, rb * A_max)
+            gat = lambda X: torch.gather(X, 2, flat.unsqueeze(-1).expand(B, H, rb * A_max, X.shape[-1])).reshape(B, H, rb, A_max, X.shape[-1])
+            t_rel = torch.arange(r0, r1, device=dev)                                # the row's index among the answer rows
+            seen = (torch.arange(r1, device=dev)[None, :] <= t_rel[:, None]).view(1, 1, rb, 1, r1)   # answer rows t' <= t
+            cand = torch.cat([gat(L_s), gat(S_aT[..., :r1])], -1)                   # [B,H,rb,A,K+r1]
+            cval = torch.cat([gat(L_v), gat(E_aT[..., :r1]) & seen], -1) & act.unsqueeze(-1)
+            kk = min(K_ret, cand.shape[-1])
+            top = torch.topk(cand.masked_fill(~cval, NEG_PAD), kk, dim=-1)
+            tval = torch.gather(cval, -1, top.indices)
+            tau_c = torch.gather(tau_all.unsqueeze(2).expand(B, H, rb, n_k), -1, order).unsqueeze(-1)
+            p_list = sparsemax_masked(tau_c * top.values.masked_fill(~tval, 0.0), tval)
+            own = (top.indices == (K_ret + t_rel).view(1, 1, rb, 1, 1)) & tval       # row t's own entry (absent: evicted -> 0)
+            p_new = (p_list * own.to(dt)).sum(-1) * act.to(dt)                       # [B,H,rb,A]
+            p_rows.append(torch.zeros(B, H, rb, n_k, dtype=dt, device=dev).scatter(-1, order, p_new))
+        p_a = torch.cat(p_rows, -2)                                                 # [B,H,m,n]; 0 off E
+        Atil_a = A_sm_a + g_a * (cbar_run * p_a - A_sm_a)                           # ST site 2
+        # ---- the row programme, row-local: identical to the dense form's
+        excess, sm_mass = row_masses(Atil_a, A_sm_a, E_a)
+        a1_a, cap_theta_a, cap_binds_a = unit_cap(Atil_a, vis_a, excess, sm_mass)
+        cbar_i_a = (g_a * a1_a).sum(-1)                                             # ST site 3
+        Rtil_a = (Atil_a * E_a.to(dt)).sum(-1)
+        if norm.tau_i_pinned:
+            tau_i_a = torch.ones(B, H, m, dtype=dt, device=dev)
+        else:
+            tau_i_a = norm.tauQ(_fp(Q[:, :, n_p:]), row_summary(Atil_a, E_a, vis_a, cbar_i_a, Rtil_a), head_offset)
+        u_a, theta_a = proj_le_masked(Atil_a.masked_fill(~E_a, 0.0), cbar_i_a / tau_i_a, E_a)
+        A_a = a1_a + g_a * (tau_i_a.unsqueeze(-1) * u_a - a1_a)                     # ST site 4
+        # ---- the hand-off to the next patched layer: the prefill's nu for the prompt keys, 1 for a key sealed at arrival
+        nu_all = torch.cat([d_p.nu, torch.ones(B, H, m, dtype=dt, device=dev)], -1)
+        if state is not None:
+            state.nu_next = nu_all
+
+        def rows(top_block, bottom):                                                # [.., n_p, n_p] over [.., m, n] -> [.., n, n]
+            if top_block is None or bottom is None:
+                return None
+            pad = torch.zeros(*top_block.shape[:-1], m, dtype=top_block.dtype, device=dev)
+            return torch.cat([torch.cat([top_block, pad], -1), bottom.to(top_block.dtype)], -2)
+
+        cat1 = lambda a, b: None if a is None else torch.cat([a, b.to(a.dtype)], -1)
+        A = rows(_fp(A_p), A_a)
+        kstar_a = (p_a > 0).sum(-2)                                                 # answer rows' entries per key
+        diag = Diagnostics(E=rows(d_p.E, E_a), logits=rows(d_p.logits, logits_a) if d_p.logits is not None and d_p.logits.shape == d_p.E.shape else None,
+                           cbar_j=cbar_run[:, :, -1, :], cbar_i=cat1(d_p.cbar_i, cbar_i_a), tau_j=tau_all, tau_i=cat1(d_p.tau_i, tau_i_a),
+                           psi_j=None, kstar=torch.cat([d_p.kstar, torch.zeros(B, H, m, dtype=d_p.kstar.dtype, device=dev)], -1) + kstar_a,
+                           nu=nu_all, theta=cat1(d_p.theta, theta_a), Rtil=cat1(d_p.Rtil, Rtil_a),
+                           supp_rel=cat1(d_p.supp_rel, ((A_a > 0) & E_a).sum(-1)), cap_binds=cat1(d_p.cap_binds, cap_binds_a),
+                           cap_theta=cat1(d_p.cap_theta, cap_theta_a), p=rows(d_p.p, p_a), a1=rows(d_p.a1, a1_a),
+                           Atil=rows(d_p.Atil, Atil_a), A_sm=rows(d_p.A_sm, A_sm_a), c=None, u=rows(d_p.u, u_a), A=A)
+        diag.extra["triggered"] = dict(n_prefill=n_p, K_ret=K_ret)
+    return A.to(out_dtype), diag

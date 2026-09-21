@@ -54,11 +54,13 @@ def teacher_forced_pass(model, ctx: MarSeaContext, prompt_ids: list, gold_ids: l
     ctx.collect = True; ctx.keep_dense_layers = set(smap); ctx.generation = False
     ctx.keep_dense_head = {l: (hs[0] if len(hs) == 1 else hs) for l, hs in smap.items()}
     ctx.keep_dense_fields = fields
+    ctx.n_prefill = len(prompt_ids)                                         # the triggered form: the prompt is the prefill
     keep = torch.nonzero(labels[0, 1:] != -100).flatten()
     with torch.autocast(device.split(":")[0] if isinstance(device, str) else "cuda", dtype=torch.bfloat16):
         out = model(input_ids=ids, use_cache=False, logits_to_keep=keep)      # only the answer positions' logits (F-8)
     loss = F.cross_entropy(out.logits[0].float(), labels[0, keep + 1], reduction="sum")
     ctx.collect = False; ctx.keep_dense_layers = set(); ctx.keep_dense_head = None; ctx.keep_dense_fields = None
+    ctx.n_prefill = None
     return float(loss), len(gold_ids), dict(ctx.diags)
 
 
@@ -357,6 +359,7 @@ def attention_level_qa(diags: dict, l_star: int, h_star: int, ex: QAExample, arm
 @torch.no_grad()
 def generate_greedy(model, tok, ctx: MarSeaContext, prompt_ids: list, max_new_tokens: int, device="cuda", frozen_prefix=True) -> str:
     ids = torch.tensor([prompt_ids], device=device)
+    ctx.n_prefill = None
     ctx.generation = frozen_prefix; ctx.clear_generation(); ctx.generation = frozen_prefix
     t0 = time.time()
     out = model.generate(input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=max_new_tokens, do_sample=False,

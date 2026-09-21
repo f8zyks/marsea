@@ -77,6 +77,8 @@ class TrainConfig:
     st_T0: float = 1.0                         # straight-through backward temperature at the start of Phase B ...
     st_anneal_steps: int = 0                   # ... annealed linearly to 1 over this many steps
     module_warmup_steps: int = 0               # the module groups' OWN linear warm-up from the start of Phase B
+    triggered: bool = False                    # the TRIGGERED teacher-forced form: train the function that decodes
+                                               # (marsea/triggered.py); dense path only so far
     gate_min_relation_recall: float = 0.0      # quick eval: stop if the relation's recall of the gold keys at the
     gate_after: int = 250                      #   answer rows is below this, this many Phase-B steps in (0 = no gate)
     allow_phase_a_layer_change: bool = False   # fork a Phase-A file saved under a different PATCHED_LAYERS (after S0)
@@ -137,6 +139,7 @@ def build_model(cfg: TrainConfig, phase_a: bool):
     cfg.patched_layers = [int(l) for l in layers]
     torch.manual_seed(cfg.seed * 7 + 1)
     ctx = MarSeaContext(mode=cfg.mode)
+    ctx.triggered = bool(cfg.triggered)
     ctx.chunk = int(cfg.chunk)                 # was MarSeaContext's default 1024 whatever the queue asked (review e982f83 I)
     if phase_a and not cfg.phase_a_patched:
         # Phase A on the UNPATCHED model: the layers are not swapped at all and stock SDPA runs.  No relation either
@@ -631,10 +634,20 @@ def anneal_gate_temperature(model, step, cfg):
             nm.gate_temperature = 1.0 + (0.2 - 1.0) * frac
 
 
+def n_prompt_tokens(labels: torch.Tensor) -> int:
+    """the prompt's length = the index of the first labelled token: rows before it are what generation PREFILLS (the
+    last of them predicts the first gold token), rows from it on are decode steps."""
+    lab = torch.nonzero(labels[0] != -100).flatten()
+    return int(lab[0]) if lab.numel() else int(labels.shape[-1])
+
+
 @torch.no_grad()
 def _answer_loss(model, s, device) -> float:
     labels = s.labels.to(device)
     keep = torch.nonzero(labels[0, 1:] != -100).flatten()
+    ctx_ = getattr(model, "marsea_ctx", None) or getattr(getattr(model, "base_model", None), "marsea_ctx", None)
+    if ctx_ is not None:
+        ctx_.n_prefill = n_prompt_tokens(labels)
     with torch.autocast("cuda", dtype=torch.bfloat16):
         out = model(input_ids=s.input_ids.to(device), use_cache=False, logits_to_keep=keep)
     return float(F.cross_entropy(out.logits[0].float(), labels[0, keep + 1], reduction="sum"))
@@ -820,6 +833,8 @@ def train_step(model, ctx, opt, data, cursor, step, cfg, log, head_lr_scale=1.0)
     for micro, s in enumerate(seqs):
         ids = s.input_ids.to(dev); labels = s.labels.to(dev)
         keep = torch.nonzero(labels[0, 1:] != -100).flatten()                   # positions that PREDICT a labelled token
+        ctx.n_prefill = n_prompt_tokens(labels)                                 # read by the triggered form only; it stays set
+                                                                                # through backward (checkpointed layers recompute)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             # no KV cache (a checkpointed recompute must not append to it); only the answer positions' logits are built
             logits = model(input_ids=ids, use_cache=False, logits_to_keep=keep).logits          # [1, n_keep, V]

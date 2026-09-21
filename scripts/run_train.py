@@ -37,6 +37,7 @@ def main():
     ap.add_argument("--recal_every", type=int, default=0, help="re-bisect b0 to rho0 every N Phase-B steps")
     ap.add_argument("--st_T0", type=float, default=1.0); ap.add_argument("--st_anneal_steps", type=int, default=0)
     ap.add_argument("--module_warmup_steps", type=int, default=0)
+    ap.add_argument("--triggered", action="store_true", help="train the TRIGGERED teacher-forced form (= prefill + decode; marsea/triggered.py); needs --mode dense")
     ap.add_argument("--gate_min_relation_recall", type=float, default=0.0); ap.add_argument("--gate_after", type=int, default=250)
     ap.add_argument("--phase_a_unpatched", action="store_true",
                     help="run Phase A on the unpatched SDPA model (cheaper; a different kernel from the one Phase B forks "
@@ -62,7 +63,7 @@ def main():
                       relation_warmstart_steps=args.relation_warmstart_steps, warmstart_mass=args.warmstart_mass,
                       warmstart_lr=args.warmstart_lr, rho0=args.rho0, recal_every=args.recal_every, st_T0=args.st_T0,
                       st_anneal_steps=args.st_anneal_steps, module_warmup_steps=args.module_warmup_steps,
-                      gate_min_relation_recall=args.gate_min_relation_recall, gate_after=args.gate_after)
+                      gate_min_relation_recall=args.gate_min_relation_recall, gate_after=args.gate_after, triggered=args.triggered)
     if args.layers: cfg.patched_layers = args.layers; cfg.detector_json = None
     quick = None
     if args.eval_ruler:

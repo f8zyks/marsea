@@ -119,6 +119,8 @@ class MarSeaContext:
                                                          # side at the detector's (l*, h*), so a pass can need two.
     keep_dense_fields: Optional[tuple] = None            # F-8: keep only these Diagnostics fields (B5 needs E, supp_rel)
     capture_inputs: bool = False
+    triggered: bool = False                              # the TRIGGERED teacher-forced form (marsea/triggered.py): a full pass
+    n_prefill: Optional[int] = None                      #   computes what prefill (rows < n_prefill) + decoding computes
     baseline_head_block: Optional[int] = None            # EVALUATION of B0/B1/B2/B4: that many Q-heads at a time on the
                                                          # dense path (see _baseline_by_head_block)
 
@@ -269,6 +271,10 @@ class MarSeaAttention(nn.Module):
             out = torch.matmul(A_row.to(q.dtype), repeat_kv(v, g))
             return out.transpose(1, 2)
         # ---- chunked path (Sec. 6.6)
+        trig = bool(ctx.triggered and ctx.n_prefill and not ctx.generation and n_q == n_k and 0 < int(ctx.n_prefill) < n_q
+                    and not ctx.phase_a and not ctx.force_empty and hasattr(self.normalizer, "tauK"))
+        if trig and ctx.mode == "chunked":
+            raise NotImplementedError("the triggered form runs on the dense path only so far: --mode dense (4K fits an H200)")
         if ctx.mode == "chunked" and not ctx.phase_a and hasattr(self.normalizer, "tauK"):
             from .chunked import marsea_chunked_attention
             state = State(nu_prev=ctx.nu_prev_for(self.layer_idx))
@@ -348,6 +354,8 @@ class MarSeaAttention(nn.Module):
                     # on `~E` with E = None (eval smoke test, 2026-09-19).  Without head blocking E is always there,
                     # which is why no test saw it.
                     self.normalizer.want_E = bool(ctx.collect or self.normalizer.want_dense_diag or ctx.generation)
+                if trig:                                                          # prompt rows as the prefill, answer rows as decode steps
+                    kw["n_prefill"] = int(ctx.n_prefill); kw["decode_K_ret"] = int(ctx.K_ret)
                 A, diag = self.normalizer.normalize(S, vis, k, q, state, **kw)
                 ctx.nu[self.layer_idx] = state.nu_next
                 if ctx.generation:                                                # prefill: seed the decode cache

@@ -37,8 +37,12 @@ def load_arm(ckpt, arm, backbone, layers, arm_kwargs, mode="dense", device="cuda
         print(f"[eval] checkpoint trained dense: forcing --mode dense (was {mode})"); mode = "dense"
     if head_block is None:
         head_block = cfg_ck.get("head_block")
+    # a model trained on the TRIGGERED teacher-forced form is evaluated on it: its teacher-forced pass is then the function
+    # that generates (marsea/triggered.py).  Read from the checkpoint like the arm's kwargs.
     cfg = TrainConfig(arm=arm, backbone=backbone, patched_layers=layers, arm_kwargs=arm_kwargs, mode=mode,
-                      head_block=head_block)
+                      head_block=head_block, triggered=bool(cfg_ck.get("triggered", False)))
+    if cfg.triggered:
+        print("[eval] checkpoint trained on the triggered form: teacher-forced passes use it")
     model, tok, ctx, layers = build_model(cfg, phase_a=(arm.lower() == "b0"))
     if ckpt:
         load_checkpoint(ckpt, model)

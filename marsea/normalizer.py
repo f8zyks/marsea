@@ -259,18 +259,35 @@ class MarSeaNormalizer(nn.Module):
     def normalize(self, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Tensor, Q: torch.Tensor,
                   state: Optional[State] = None, *, logits_override: Optional[torch.Tensor] = None,
                   tau_j_override=None, tau_i_override=None, E_override: Optional[torch.Tensor] = None,
-                  head_offset: int = 0):
-        """With head_block set, the Q-heads are processed in blocks and the results concatenated.  Every program is
+                  head_offset: int = 0, n_prefill: Optional[int] = None, decode_K_ret: int = 64):
+        """n_prefill: the TRIGGERED teacher-forced form (marsea/triggered.py) -- rows < n_prefill are the prompt and
+        are normalised as the generation prefill is; every later row re-solves the columns its own relation triggers
+        over the members that exist by then, as decode_step does.  None: the full-sequence form.
+
+        With head_block set, the Q-heads are processed in blocks and the results concatenated.  Every program is
         per Q-head (spec Sec. 6.2: "the programs, E, tau_j, tau_i, nu are all per Q-head ... log per Q-head, aggregate
         never"), so this is the head-axis analogue of the key chunking of Sec. 6.6 -- arithmetically identical, and it
         divides the [B, H, n_q, n_k] transients that dominate memory by H / head_block."""
+        trig = {}
+        if n_prefill is not None and 0 < int(n_prefill) < S.shape[-2] and S.shape[-2] == S.shape[-1]:
+            assert tau_j_override is None and tau_i_override is None and E_override is None, "overrides: full-sequence form only"
+            trig = dict(n_prefill=int(n_prefill), decode_K_ret=int(decode_K_ret))
         if self.head_block and S.shape[1] > self.head_block:
             return self._normalize_by_head_block(S, vis, K_kv, Q, state, logits_override=logits_override,
                                                  tau_j_override=tau_j_override, tau_i_override=tau_i_override,
-                                                 E_override=E_override, head_offset=head_offset)
-        return self._normalize_one(S, vis, K_kv, Q, state, logits_override=logits_override,
-                                   tau_j_override=tau_j_override, tau_i_override=tau_i_override, E_override=E_override,
-                                   head_offset=head_offset)
+                                                 E_override=E_override, head_offset=head_offset, **trig)
+        return self._dispatch_one(S, vis, K_kv, Q, state, logits_override=logits_override,
+                                  tau_j_override=tau_j_override, tau_i_override=tau_i_override, E_override=E_override,
+                                  head_offset=head_offset, **trig)
+
+    def _dispatch_one(self, S, vis, K_kv, Q, state=None, *, n_prefill=None, decode_K_ret: int = 64, head_offset: int = 0,
+                      logits_override=None, tau_j_override=None, tau_i_override=None, E_override=None):
+        if n_prefill is None:
+            return self._normalize_one(S, vis, K_kv, Q, state, logits_override=logits_override, tau_j_override=tau_j_override,
+                                       tau_i_override=tau_i_override, E_override=E_override, head_offset=head_offset)
+        from .triggered import normalize_triggered
+        return normalize_triggered(self, S, vis, K_kv, Q, state, n_prefill, K_ret=decode_K_ret, head_offset=head_offset,
+                                   logits_override=logits_override)
 
     def _normalize_by_head_block(self, S, vis, K_kv, Q, state, head_offset: int = 0, **kw):
         from .relation import repeat_kv as _rk
@@ -293,11 +310,11 @@ class MarSeaNormalizer(nn.Module):
                 # live at a time during the backward.  Without this the concatenation holds every block's and the
                 # blocking saves nothing.
                 import torch.utils.checkpoint as _cp
-                A_h, d_h = _cp.checkpoint(self._normalize_one, S[:, sl], vis_b[:, sl], k_rep[:, sl], Q[:, sl], st,
+                A_h, d_h = _cp.checkpoint(self._dispatch_one, S[:, sl], vis_b[:, sl], k_rep[:, sl], Q[:, sl], st,
                                           use_reentrant=False, head_offset=head_offset + h0, **sub)
             else:
-                A_h, d_h = self._normalize_one(S[:, sl], vis_b[:, sl], k_rep[:, sl], Q[:, sl], st,
-                                               head_offset=head_offset + h0, **sub)
+                A_h, d_h = self._dispatch_one(S[:, sl], vis_b[:, sl], k_rep[:, sl], Q[:, sl], st,
+                                              head_offset=head_offset + h0, **sub)
             outs.append(A_h); diags.append(d_h)
             if state is not None and st.nu_next is not None:
                 state.nu_next = st.nu_next if state.nu_next is None or h0 == 0 else torch.cat([state.nu_next, st.nu_next], 1)
