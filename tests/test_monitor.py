@@ -65,3 +65,31 @@ def test_a_non_finite_gradient_is_named_by_parameter():
     assert nonfinite_grad_names(m) == ["0.bias", "1.weight"]
     src = (pathlib.Path(__file__).resolve().parents[1] / "marsea/train.py").read_text()
     assert 'nan_step{step}.pt' in src and "nonfinite_grad_names(model)" in src
+
+
+@pytest.mark.parametrize("triggered", [False, True])
+def test_gold_by_head_reports_every_head_and_agrees_with_the_single_head_monitor(triggered):
+    """owner's request (2026-09-21): per head, the fraction of gold tokens IN the relation and OFF it."""
+    from marsea.monitor import gold_by_head, monitor_example, format_heads, HEAD_KEYS
+    model, ctx = _tiny_model(); ctx.triggered = triggered
+    ex = _example()
+    res = gold_by_head(model, ctx, [ex, ex], [1, 2], device="cpu")
+    assert res["n_rows"] == 12 and set(res["layers"]) == {"1", "2"}
+    for l, r in res["layers"].items():
+        assert set(HEAD_KEYS) <= set(r) and all(len(r[k]) == 8 for k in HEAD_KEYS)
+        for h in range(8):
+            assert abs(r["src_in_relation"][h] + r["src_off_relation"][h] - 1.0) < 1e-12     # the two fractions: everything is somewhere
+            assert 0.0 <= r["gold_in_relation"][h] <= 1.0 and 0.0 <= r["src_mass_softmax"][h] <= 1.0
+    recs = monitor_example(model, ctx, ex, 2, 1, device="cpu")                                # the single-head monitor at (2, 1)
+    r = res["layers"]["2"]
+    mean = lambda k: sum(x[k] for x in recs) / len(recs)
+    assert abs(r["src_in_relation"][1] - mean("src_in_relation")) < 1e-12 and abs(r["src_mass_softmax"][1] - mean("src_mass_softmax")) < 1e-12
+    assert abs(r["src_mass_final"][1] - mean("src_mass_final")) < 1e-12 and abs(r["relation_size"][1] - mean("relation_size")) < 1e-9
+    text = format_heads(7, res)
+    assert text.count("\n") == 8 and "IN relation" in text and "OFF" in text
+    for x in recs:                                                                            # which stage zeroed a member source
+        if x["src_in_relation"]:
+            assert x["src_zero_column"] + x["src_zero_cap"] + x["src_zero_step2"] == float(x["src_mass_final"] == 0)
+        else:
+            assert math.isnan(x["src_zero_column"])
+

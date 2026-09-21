@@ -14,16 +14,17 @@ def main():
     args = ap.parse_args()
     from run_eval import load_arm
     from marsea.data.ruler import load_set, build_example
-    from marsea.monitor import monitor_example, summarise, format_line
+    from marsea.monitor import monitor_example, summarise, format_line, gold_by_head
     det = json.load(open(args.detector)); layers = det["patched_layers"]
     res = {}
     for ck in args.ckpt:
         model, tok, ctx = load_arm(ck, args.arm, args.backbone, layers, {}, "dense", head_block=2, det=det)
-        recs = []
-        for f in sorted(glob.glob(args.set)):
-            for r in load_set(f)[:args.n]:
-                recs += monitor_example(model, ctx, build_example(r, tok), det["l_star"], det["h_star"])
-        res[ck] = summarise(recs); print(ck); print(format_line("-", res[ck]), flush=True)
+        recs = []; exs = [build_example(r, tok) for f in sorted(glob.glob(args.set)) for r in load_set(f)[:args.n]]
+        for ex in exs:
+            recs += monitor_example(model, ctx, ex, det["l_star"], det["h_star"])
+        res[ck] = summarise(recs)
+        res[ck]["by_head"] = gold_by_head(model, ctx, exs, layers)             # where the gold tokens are, for every head
+        print(ck); print(format_line("-", res[ck]), flush=True)
         del model; torch.cuda.empty_cache()
         if args.out:
             json.dump(res, open(args.out, "w"), indent=1)

@@ -262,11 +262,13 @@ class TailShare(_Head):
     Initialised at lambda_init (small): Phase B starts next to the relation-only cap that lambda = 0 is."""
     N_SCALAR = 5 + 8
 
-    def __init__(self, d_head: int, hidden: int = 64, lam_max: float = 0.5, lam_init: float = 0.05, per_head: int = 0):
+    def __init__(self, d_head: int, hidden: int = 64, lam_max: float = 0.5, lam_init: float = 0.05, per_head: int = 0, lam_min: float = 0.0):
         super().__init__(d_head, self.N_SCALAR, hidden, 0.0, 1.0, per_head)
-        assert 0.0 < lam_init < lam_max <= 1.0
-        self.lam_max = float(lam_max)
-        r = lam_init / lam_max
+        # lam_min (owner's decision, 2026-09-21): P10's share started at 0.05 and went to ~0 as the relation emptied -- the
+        # training signal did not bring it into a useful range.  lambda = lam_min + (lam_max - lam_min) sigmoid(.)
+        assert 0.0 <= lam_min < lam_init < lam_max <= 1.0
+        self.lam_max = float(lam_max); self.lam_min = float(lam_min)
+        r = (lam_init - lam_min) / (lam_max - lam_min)
         self.last_bias.data.fill_(math.log(r / (1.0 - r)))
 
     @staticmethod
@@ -277,5 +279,5 @@ class TailShare(_Head):
 
     def forward(self, q: torch.Tensor, summary: torch.Tensor, head_offset: int = 0) -> torch.Tensor:
         x = torch.cat([self.ln(_fp(q)), feat(_fp(summary))], dim=-1)
-        return self.lam_max * torch.sigmoid(self._mlp(x, head_offset))
+        return self.lam_min + (self.lam_max - self.lam_min) * torch.sigmoid(self._mlp(x, head_offset))
 

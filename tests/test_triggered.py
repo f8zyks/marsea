@@ -44,7 +44,7 @@ def _by_decoding(norm, Q, K_kv, S, vis, n_p, K_ret):
                                       (64, dict(size_aware_tau_i=True)), (3, dict(size_aware_tau_i=True, trigger_tau=True)),
                                       (64, dict(size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2)),
                                       (64, dict(cap_mode="relation")), (3, dict(cap_mode="relation")),
-                                      (64, dict(cap_mode="relation", tail_share=0.3)), (64, dict(cap_mode="relation", tail_share=0.3, tau_i_floor=1.0, size_aware_tau_i=True, trigger_tau=True)), (3, dict(cap_mode="relation", tail_share_learned=True)),
+                                      (64, dict(cap_mode="relation", tail_share=0.3)), (64, dict(cap_mode="relation", tail_share=0.3, tau_i_floor=1.0, size_aware_tau_i=True, trigger_tau=True)), (3, dict(cap_mode="relation", tail_share_learned=True)), (64, dict(cap_mode="relation", tail_share_learned=True, tail_share_min=0.2, tail_share_init=0.25, tau_i_floor=1.0)),
                                       (64, dict(cap_mode="relation", tail_share_learned=True, size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2)),
                                       (64, dict(cap_mode="relation", size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2))])
 def test_triggered_equals_prefill_plus_decode(K_ret, kw):
@@ -313,6 +313,9 @@ def test_a_tail_share_lets_the_relation_keep_mass_and_scales_the_tail_without_a_
 def test_the_learned_tail_share_is_bounded_starts_small_trains_and_needs_the_relation_cap():
     from marsea.heads import TailShare
     from marsea.normalizer import MarSeaNormalizer
+    hf = TailShare(D, lam_max=0.5, lam_init=0.25, per_head=6, lam_min=0.2).to(DT)             # the floored share (owner, 2026-09-21)
+    lf = hf(torch.randn(1, 6, 9, D, dtype=DT), 50 * torch.randn(1, 6, 9, TailShare.N_SCALAR, dtype=DT))
+    assert float(lf.min()) >= 0.2 and float(lf.max()) <= 0.5 and abs(float(hf(torch.zeros(1, 6, 1, D, dtype=DT), torch.zeros(1, 6, 1, TailShare.N_SCALAR, dtype=DT)).mean()) - 0.25) < 0.02
     h = TailShare(D, lam_max=0.5, lam_init=0.05, per_head=6).to(DT)
     lam = h(torch.randn(1, 6, 9, D, dtype=DT), torch.randn(1, 6, 9, TailShare.N_SCALAR, dtype=DT).abs())
     assert float(lam.min()) > 0 and float(lam.max()) < 0.5 and abs(float(lam.mean()) - 0.05) < 0.01

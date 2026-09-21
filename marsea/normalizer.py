@@ -293,7 +293,8 @@ class MarSeaNormalizer(nn.Module):
                  block_size: int = 512, head_block: Optional[int] = None, head_block_recompute: bool = True,
                  relation_per_head: int = 0, trigger_tau: bool = False, size_aware_tau_i: bool = False,
                  cap_mode: str = "row", tail_share: float = 0.0, tail_share_learned: bool = False,
-                 tail_share_max: float = 0.5, tail_share_init: float = 0.05, tau_i_floor: float = 0.0):
+                 tail_share_max: float = 0.5, tail_share_init: float = 0.05, tau_i_floor: float = 0.0,
+                 tail_share_min: float = 0.0):
         super().__init__()
         assert quota_mode in ("inherited", "uniform")
         assert gate in ("st", "hard_concrete")
@@ -328,7 +329,7 @@ class MarSeaNormalizer(nn.Module):
         assert cap_mode == "relation" or not (tail_share > 0.0 or tail_share_learned), "a tail share needs cap_mode = 'relation'"
         self.tail_share = float(tail_share)
         from .heads import TailShare
-        self.tail_share_head = TailShare(d_head, hidden, tail_share_max, tail_share_init, per_head=per_head) if tail_share_learned else None
+        self.tail_share_head = TailShare(d_head, hidden, tail_share_max, tail_share_init, per_head=per_head, lam_min=tail_share_min) if tail_share_learned else None
         self.st_temperature = 1.0               # straight-through backward temperature; the trainer anneals it to 1
         self.tauK = TauK(d_head, hidden, tau_min, zero_field_inputs=key_only_tau, no_nu=no_nu, per_head=per_head)
         # tau_i_floor = 1: fan-in step 2 can only SHARPEN.  With tau_i < 1 its quota cbar_i / tau_i exceeds what the relation

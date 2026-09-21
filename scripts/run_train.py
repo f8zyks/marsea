@@ -82,7 +82,7 @@ def main():
         if args.monitor_every:
             from marsea.monitor import monitor_factory
             mon = [build_example(r, tok) for f in eval_files for r in load_jsonl(f)[:args.monitor_n]]
-            monitor = monitor_factory(mon, l_star, h_star)
+            monitor = monitor_factory(mon, l_star, h_star, layers=layers)
     train(cfg, data, quick_eval=quick, monitor=monitor)
 
 

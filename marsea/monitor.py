@@ -32,7 +32,8 @@ from .evaluate import teacher_forced_pass, _kept_head, _scores_at
 ROW_KEYS = ("src_in_relation", "src_in_support", "src_mass_softmax", "src_mass_Atil", "src_mass_a1", "src_mass_final", "src_rank_final",
             "relation_size", "relation_kept_frac", "relation_mass_softmax", "relation_mass_Atil", "relation_mass_final", "overpay_ratio",
             "cap_binds", "tail_kept_frac", "tail_mass_softmax", "tail_mass_final", "support_size", "tau_i",
-            "rel_Atil_max", "rel_Atil_gap", "rel_Atil_mean", "rel_Atil_std")
+            "rel_Atil_max", "rel_Atil_gap", "rel_Atil_mean", "rel_Atil_std",
+            "src_zero_column", "src_zero_cap", "src_zero_step2")            # member rows only: WHICH stage zeroed the copy source
 COL_KEYS = ("col_size", "col_answer_members", "col_precision", "row_share_p", "tau_used", "tau_sealed", "col_quota",
             "col_score_max", "col_score_gap", "col_score_mean", "col_score_std", "row_standing")
 
@@ -89,7 +90,10 @@ def monitor_example(model, ctx, ex, l_star: int, h_star: int, device="cuda") -> 
                    cap_binds=float(d.cap_binds[0, hh, r]), tail_kept_frac=float(((A[r] > 0) & off).sum() / max(1, int(off.sum()))),
                    tail_mass_softmax=float(Asm[r][off].sum()), tail_mass_final=float(A[r][off].sum()),
                    support_size=float(((A[r] > 0) & vis).sum()), tau_i=float(d.tau_i[0, hh, r]),
-                   rel_Atil_max=mx, rel_Atil_gap=gap, rel_Atil_mean=mean, rel_Atil_std=std)
+                   rel_Atil_max=mx, rel_Atil_gap=gap, rel_Atil_mean=mean, rel_Atil_std=std,
+                   src_zero_column=float(Atil[r, j] == 0) if bool(Er[j]) else float("nan"),
+                   src_zero_cap=float((Atil[r, j] > 0) & (a1[r, j] == 0)) if bool(Er[j]) else float("nan"),
+                   src_zero_step2=float((a1[r, j] > 0) & (A[r, j] == 0)) if bool(Er[j]) else float("nan"))
         # ---- the copy source's column, as it stood when row r triggered it: its members are the rows <= r that relate to j
         mem = E[:, j] & (ar >= j) & (ar <= r)                                    # the triggered solve's members (the full-sequence
                                                                                   # form also had the rows after r in its one solve)
@@ -105,6 +109,83 @@ def monitor_example(model, ctx, ex, l_star: int, h_star: int, device="cuda") -> 
                    row_standing=(float(S[r, j]) - cmx) if member else nan)
         recs.append(rec)
     return recs
+
+
+HEAD_KEYS = ("src_mass_softmax", "src_in_relation", "src_off_relation", "gold_in_relation", "src_mass_final", "src_mass_final_in",
+             "src_mass_softmax_in", "src_mass_final_off", "src_mass_softmax_off", "src_zeroed", "relation_size")
+
+
+@torch.no_grad()
+def gold_by_head_example(model, ctx, ex, layers, device="cuda"):
+    """WHERE THE GOLD TOKENS GO, for EVERY Q-head of every patched layer (owner's request, 2026-09-21): one teacher-forced
+    pass keeping all heads' E / A_sm / A.  Per (layer, head), sums over the example's answer rows r with copy source j:
+      src_mass_softmax   how much the head attends the source at all (its relevance: most heads are not retrieval heads)
+      src_in_relation / src_off_relation     the source is in E_r. / is not  (the two fractions sum to 1)
+      gold_in_relation   the share of ALL gold-value tokens visible to the row that are in E_r.
+      src_mass_final, and softmax -> final separately for the rows where the source is IN and OFF the relation
+      src_zeroed         the source's final attention is an exact zero;   relation_size  |E_r.|
+    -> {layer: {key: tensor [H] of SUMS}}, n_rows.  Summed (not averaged) so examples pool exactly."""
+    cs = [(r, j) for r, j, v, k in copy_sources(ex)]
+    if not cs:
+        return {}, 0
+    out = {}; H = model.config.num_attention_heads
+    sites = [(l, h) for l in layers for h in range(H)]
+    _, _, dg = teacher_forced_pass(model, ctx, ex.prompt_ids, ex.gold_ids, layers[0], device, sites=sites, fields=("E", "A_sm", "A"))
+    for l in layers:
+        d = dg.get(l)
+        if d is None or d.E is None:
+            continue
+        n = d.A.shape[-1]; dev = d.A.device
+        rows = torch.tensor([r for r, j in cs if r < n and j < n], device=dev); src = torch.tensor([j for r, j in cs if r < n and j < n], device=dev)
+        gold = torch.zeros(n, dtype=torch.bool, device=dev)
+        for (a, b) in ex.value_spans: gold[a:min(b, n)] = True
+        E = d.E[0][:, rows]; Asm = d.A_sm[0][:, rows]; A = d.A[0][:, rows]    # [H, R, n]
+        idx = src.view(1, -1, 1).expand(E.shape[0], -1, 1)
+        inE = torch.gather(E, -1, idx).squeeze(-1).to(A.dtype); sm = torch.gather(Asm, -1, idx).squeeze(-1); fin = torch.gather(A, -1, idx).squeeze(-1)
+        gvis = gold.view(1, 1, -1) & (torch.arange(n, device=dev).view(1, 1, -1) <= rows.view(1, -1, 1))
+        gfrac = (E & gvis).sum(-1).to(A.dtype) / gvis.sum(-1).clamp_min(1).to(A.dtype)
+        out[l] = dict(src_mass_softmax=sm.sum(-1), src_in_relation=inE.sum(-1), src_off_relation=(1 - inE).sum(-1), gold_in_relation=gfrac.sum(-1),
+                      src_mass_final=fin.sum(-1), src_mass_final_in=(fin * inE).sum(-1), src_mass_softmax_in=(sm * inE).sum(-1),
+                      src_mass_final_off=(fin * (1 - inE)).sum(-1), src_mass_softmax_off=(sm * (1 - inE)).sum(-1),
+                      src_zeroed=(fin == 0).to(A.dtype).sum(-1), relation_size=E.sum(-1).to(A.dtype).sum(-1))
+        out[l] = {k: v.double().cpu() for k, v in out[l].items()}
+    return out, len(cs)
+
+
+def gold_by_head(model, ctx, examples, layers, device="cuda") -> dict:
+    """-> {layer: {key: [H floats]}} over the examples: fractions / means per answer row; the *_in / *_off masses are means
+    over the rows where the source is in / off the relation (None where there is no such row)."""
+    tot = {}; n_rows = 0
+    for ex in examples:
+        o, k = gold_by_head_example(model, ctx, ex, layers, device); n_rows += k
+        for l, dd in o.items():
+            for key, v in dd.items():
+                tot.setdefault(l, {}); tot[l][key] = tot[l].get(key, 0) + v
+    res = dict(n_rows=n_rows, layers={})
+    for l, dd in tot.items():
+        n_in, n_off = dd["src_in_relation"], dd["src_off_relation"]
+        r = {}
+        for key, v in dd.items():
+            den = n_in if key.endswith("_in") else n_off if key.endswith("_off") else torch.full_like(v, float(max(1, n_rows)))
+            r[key] = [None if float(b) == 0 else float(a) / float(b) for a, b in zip(v, den)]
+        res["layers"][str(l)] = r
+    return res
+
+
+def format_heads(step, res: dict, top: int = 8) -> str:
+    """the heads that attend the copy source most (softmax mass), one per line: where their gold tokens are."""
+    if not res or not res.get("layers"):
+        return f"[heads] step {step}: no rows"
+    f = lambda v, nd=2: "-" if v is None else f"{v:.{nd}f}"
+    items = [(l, h, r) for l, r in res["layers"].items() for h in range(len(r["src_mass_softmax"]))]
+    items.sort(key=lambda t: -(t[2]["src_mass_softmax"][t[1]] or 0.0))
+    lines = [f"[heads] step {step}  the {top} heads that attend the copy source most (of {len(items)}); rows {res['n_rows']}"]
+    for l, h, r in items[:top]:
+        g = lambda k: r[k][h]
+        lines.append(f"   L{l} h{h}: source softmax mass {f(g('src_mass_softmax'))} | source IN relation {f(g('src_in_relation'))} OFF {f(g('src_off_relation'))} "
+                     f"| all gold tokens in relation {f(g('gold_in_relation'))} | mass softmax>final: in {f(g('src_mass_softmax_in'))}>{f(g('src_mass_final_in'))} "
+                     f"off {f(g('src_mass_softmax_off'))}>{f(g('src_mass_final_off'))} | source zeroed {f(g('src_zeroed'))} | |E_i| {f(g('relation_size'), 0)}")
+    return "\n".join(lines)
 
 
 def summarise(recs: list) -> dict:
@@ -129,13 +210,17 @@ def summarise(recs: list) -> dict:
     return res
 
 
-def monitor_factory(examples: list, l_star: int, h_star: int, device="cuda"):
-    """-> callable(model, ctx, step) -> dict for train()'s `monitor` hook."""
+def monitor_factory(examples: list, l_star: int, h_star: int, device="cuda", layers=None):
+    """-> callable(model, ctx, step) -> dict for train()'s `monitor` hook.  layers: the patched layers -- adds the per-head
+    report of where the gold tokens are (res["by_head"])."""
     def monitor(model, ctx, step):
         recs = []
         for ex in examples:
             recs += monitor_example(model, ctx, ex, l_star, h_star, device)
-        return summarise(recs)
+        res = summarise(recs)
+        if layers:
+            res["by_head"] = gold_by_head(model, ctx, examples, list(layers), device)
+        return res
     return monitor
 
 
@@ -149,4 +234,9 @@ def format_line(step, res: dict) -> str:
         parts.append(f"{name}: src in E {f(a['src_in_relation'], 2)} in supp {f(a['src_in_support'], 2)} mass {f(a['src_mass_softmax'], 2)}>{f(a['src_mass_final'], 2)} "
                      f"| |E_i| {f(a['relation_size'], 0)} overpay x{f(a['overpay_ratio'], 2)} cap {f(a['cap_binds'], 2)} tail kept {f(a['tail_kept_frac'], 2)} x{f(a.get('tail_scale'), 2)} rel gain x{f(a.get('relation_gain'), 2)} "
                      f"| col size {f(a['col_size'], 0)} share {f(a['row_share_p'], 2)} tau {f(a['tau_used'], 2)} standing {f(a['row_standing'], 2)}")
-    return f"[monitor] step {step}  " + "  ||  ".join(parts)
+    zero = res["all"]
+    tail = (f"  ||  source zeroed (member rows) by column {f(zero.get('src_zero_column'), 2)} cap {f(zero.get('src_zero_cap'), 2)} step 2 {f(zero.get('src_zero_step2'), 2)}")
+    line = f"[monitor] step {step}  " + "  ||  ".join(parts) + tail
+    if res.get("by_head"):
+        line += "\n" + format_heads(step, res["by_head"])
+    return line
