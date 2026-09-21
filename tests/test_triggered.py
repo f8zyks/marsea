@@ -253,3 +253,23 @@ def test_gradients_flow_through_the_relation_only_cap_and_the_chunked_path_refus
     V = torch.randn(1, K_kv.shape[1], S.shape[-1], D, dtype=DT)
     with pytest.raises(NotImplementedError), torch.no_grad():
         marsea_chunked_attention(norm, Q, K_kv, V, vis, State(), chunk=16)
+
+
+def test_a_padded_slot_on_a_column_the_row_cannot_see_does_not_poison_the_gradient():
+    """P7, step 751 (2026-09-21): one head's relation at an answer row had grown to the whole row, so the block's slot count
+    reached past what the EARLIER answer rows can see; their padded slots sat on invisible columns (score -inf), the
+    trigger-time tau head read s_trig - max = -inf and returned NaN there.  The forward masks those slots out; the backward
+    of the head is 0 * NaN, and every parameter below went NaN (three identical retries, run stopped)."""
+    norm, Q, K_kv, S, vis, n_p = _setup(trigger_tau=True)
+    T = S.shape[-1]
+    lg = torch.full_like(S, -1.0)
+    lg[:, :, T - 1, :] = 1.0                                   # the last answer row relates to every key it sees
+    lg[:, :, n_p, 3] = 1.0                                     # the first one to a single key: its padded slots run past column n_p
+    Q = Q.clone().requires_grad_(True)
+    A, d = norm.normalize(S, vis, K_kv, Q, State(), n_prefill=n_p, logits_override=lg)
+    assert bool(torch.isfinite(A).all()) and int(d.E[:, :, T - 1].sum(-1).min()) > n_p
+    assert bool(torch.isfinite(d.extra["tau_trig_rows"]).all())
+    A.pow(2).sum().backward()
+    bad = [n_ for n_, p_ in norm.named_parameters() if p_.grad is not None and not bool(torch.isfinite(p_.grad).all())]
+    assert bad == [] and bool(torch.isfinite(Q.grad).all()), bad
+    assert float(norm.tauK_trig.fc2.weight.grad.abs().sum()) > 0

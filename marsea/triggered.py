@@ -56,15 +56,16 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
     # ---- the prompt: exactly the generation prefill
     nu_prev = state.nu_prev if (state is not None and state.nu_prev is not None) else None
     st_p = State(nu_prev=None if nu_prev is None else nu_prev[..., :n_p])
+    full_lo = logits_override is not None and tuple(logits_override.shape[-2:]) == (n_k, n_k)    # a whole [n, n] override: sliced
     A_p, d_p = norm._normalize_one(S[:, :, :n_p, :n_p], visb[:, :, :n_p, :n_p], K_kv[:, :, :n_p], Q[:, :, :n_p], st_p,
-                                   logits_override=logits_override, head_offset=head_offset)
+                                   logits_override=(logits_override[..., :n_p, :n_p] if full_lo else logits_override), head_offset=head_offset)
     with torch.autocast(device_type=S.device.type, enabled=False):
         S32 = _fp(S).masked_fill(~visb, float("-inf"))
         dt, dev = S32.dtype, S.device
         S_a = S32[:, :, n_p:, :]; vis_a = visb[:, :, n_p:, :]                       # [B,H,m,n]
         A_sm_a = row_softmax(S_a, vis_a)
         if logits_override is not None:
-            logits_a = _fp(logits_override).expand(B, H, m, n_k)
+            logits_a = _fp(logits_override[..., n_p:, :] if full_lo else logits_override).expand(B, H, m, n_k)
         else:
             logits_a = norm.relation(K_kv, Q[:, :, n_p:], key_offset=0, n_k_total=n_k, head_offset=head_offset)
         E_a = (logits_a > 0) & vis_a
@@ -116,7 +117,11 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
             if trig_tau is None:
                 tau_c = torch.gather(tau_all.unsqueeze(2).expand(B, H, rb, n_k), -1, order).unsqueeze(-1)   # sealed
             else:                                                                   # predicted NOW, from the column as it stands
-                st = trigger_stats(top.values, tval, torch.gather(cnt_run[:, :, r0:r1], -1, order), torch.gather(S_a[:, :, r0:r1], -1, order))
+                # the PADDED slots (a row with fewer active columns than the block's widest) must reach the MLP with finite
+                # features: a padded slot can sit on a column the row cannot see, whose score is -inf, and then tau is NaN
+                # there -- masked out of the forward, but the backward of tau * values is 0 * NaN (P7, step 751, 2026-09-21)
+                s_tr = torch.gather(S_a[:, :, r0:r1], -1, order).masked_fill(~act, 0.0)
+                st = trigger_stats(top.values, tval, torch.gather(cnt_run[:, :, r0:r1], -1, order), s_tr)
                 k_act = torch.gather(k_all, 2, flat.unsqueeze(-1).expand(B, H, rb * A_max, k_all.shape[-1]))
                 tau_c = trig_tau(k_act, st.reshape(B, H, rb * A_max, 6), head_offset).reshape(B, H, rb, A_max, 1)
             p_list = sparsemax_masked(tau_c * top.values.masked_fill(~tval, 0.0), tval)
