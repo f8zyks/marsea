@@ -40,7 +40,9 @@ def _by_decoding(norm, Q, K_kv, S, vis, n_p, K_ret):
                                       (64, dict(tau_i_pinned=True)), (64, dict(trigger_tau=True)), (3, dict(trigger_tau=True)),
                                       (64, dict(trigger_tau=True, relation_per_head=6, per_head=6, head_block=2)),
                                       (64, dict(size_aware_tau_i=True)), (3, dict(size_aware_tau_i=True, trigger_tau=True)),
-                                      (64, dict(size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2))])
+                                      (64, dict(size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2)),
+                                      (64, dict(cap_mode="relation")), (3, dict(cap_mode="relation", cap_fallback_tail_dominates=True)),
+                                      (64, dict(cap_mode="relation", size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2))])
 def test_triggered_equals_prefill_plus_decode(K_ret, kw):
     norm, Q, K_kv, S, vis, n_p = _setup(**kw)
     A_p, A_dec = _by_decoding(norm, Q, K_kv, S, vis, n_p, K_ret)
@@ -93,7 +95,7 @@ def test_nu_handoff_is_the_prefills_for_prompt_keys_and_one_for_answer_keys():
 
 
 # ------------------------------------------------------------------------------------------ the whole model
-def _tiny_model(head_block=None, sized=True):
+def _tiny_model(head_block=None, sized=True, cap_mode="relation"):
     from transformers import Qwen2Config, Qwen2ForCausalLM
     from marsea.backbone import patch_model, MarSeaContext
     from marsea.baselines import make_normalizer
@@ -104,7 +106,7 @@ def _tiny_model(head_block=None, sized=True):
     ctx = MarSeaContext(mode="dense")
     torch.manual_seed(1)
     patch_model(model, [1, 2], lambda l: make_normalizer("marsea", 8, head_block=head_block, relation_per_head=8, per_head=8,
-                                                         trigger_tau=True, size_aware_tau_i=sized).double(), ctx)
+                                                         trigger_tau=True, size_aware_tau_i=sized, cap_mode=cap_mode).double(), ctx)
     with torch.no_grad():
         for l in (1, 2):
             nm = model.model.layers[l].self_attn.normalizer
@@ -142,7 +144,7 @@ def test_teacher_forced_logits_equal_cached_decoding_step_by_step(hb):
 
 
 def test_the_chunked_path_refuses_rather_than_silently_running_the_leaky_form():
-    model, ctx = _tiny_model(sized=False)
+    model, ctx = _tiny_model(sized=False, cap_mode="row")
     ctx.mode = "chunked"; ctx.triggered = True; ctx.n_prefill = 20
     with pytest.raises(NotImplementedError), torch.no_grad():
         model(input_ids=torch.randint(0, 97, (1, 32)), use_cache=False)
@@ -203,6 +205,59 @@ def test_the_size_aware_tau_i_sees_twelve_scalars_and_the_chunked_path_refuses()
     from marsea.chunked import marsea_chunked_attention
     norm, Q, K_kv, S, vis, n_p = _setup(size_aware_tau_i=True)
     assert norm.tauQ.sized and norm.tauQ.fc1.in_features == D + 12 and MarSeaNormalizer(D, R).tauQ.fc1.in_features == D + 4
+    V = torch.randn(1, K_kv.shape[1], S.shape[-1], D, dtype=DT)
+    with pytest.raises(NotImplementedError), torch.no_grad():
+        marsea_chunked_attention(norm, Q, K_kv, V, vis, State(), chunk=16)
+
+
+# ------------------------------------------------------------------------------------------ the relation-only cap
+def _capped(cap_mode, **kw):
+    norm, Q, K_kv, S, vis, n_p = _setup(rho=0.4, cap_mode=cap_mode, **kw)
+    with torch.no_grad():
+        A, d = norm.normalize(S, vis, K_kv, Q, State())
+    return norm, d, vis
+
+
+def test_the_relation_only_cap_leaves_the_tail_alone_and_the_row_at_its_softmax_mass():
+    norm, d, vis = _capped("relation")
+    visb = vis.expand_as(d.E); off = visb & ~d.E; b = d.cap_binds
+    assert int(b.sum()) > 10, "no binding rows: the case does not exercise the cap"
+    assert torch.equal(d.a1[off], d.A_sm[off])                                             # the off-relation tail: bitwise softmax, everywhere
+    rel_sm = (d.A_sm * d.E).sum(-1); rel_a1 = (d.a1 * d.E).sum(-1); rel_til = (d.Atil * d.E).sum(-1)
+    assert float((rel_a1[b] - rel_sm[b]).abs().max()) < 1e-9                               # a binding row: the relation back on its own softmax mass
+    assert bool((rel_til[b] > rel_sm[b]).all()) and float((d.a1.sum(-1)[b] - d.A_sm.sum(-1)[b]).abs().max()) < 1e-9
+    assert torch.equal(d.a1[~b], d.Atil[~b])                                               # a non-binding row: untouched
+    assert bool((d.a1 <= d.Atil + 1e-15).all()) and bool(((d.a1 == 0) & (d.Atil > 0) & d.E)[b].any())   # never adds mass; exact zeros on the relation
+    _, d_row, _ = _capped("row")
+    assert torch.equal(d_row.cap_binds, b)                                                 # the SAME decision as the whole-row cap
+    assert float((d_row.a1[off] - d_row.A_sm[off]).abs().max()) > 1e-6                     # which does touch the tail
+
+
+def test_edge_cases_budget_is_never_negative_and_the_tail_dominates_fallback_is_a_switch():
+    from marsea.normalizer import unit_cap_relation, apply_unit_cap, row_masses, unit_cap
+    norm, d, vis = _capped("relation")
+    assert float(((d.A_sm * d.E).sum(-1)).min()) >= 0.0                                    # edge case 1: a sum of softmax entries
+    # a relation with ZERO softmax mass but paid by the column programme: projected to nothing, the row is its softmax
+    A_sm = torch.tensor([[[[0.0, 0.6, 0.4]]]], dtype=DT); E = torch.tensor([[[[True, False, False]]]]); Atil = torch.tensor([[[[0.5, 0.6, 0.4]]]], dtype=DT)
+    ex, sm = row_masses(Atil, A_sm, E)
+    a1, th, took = unit_cap_relation(Atil, A_sm, E, ex)
+    assert a1.tolist() == [[[[0.0, 0.6, 0.4]]]] and bool(took.all())
+    # edge case 2: off by default; when switched on, a tail-dominated row gets the whole-row cap, the others do not
+    norm.cap_fallback_tail_dominates = True
+    visb = vis.expand_as(d.E); ex, sm = row_masses(d.Atil, d.A_sm, d.E)
+    a1_fb, _, _ = apply_unit_cap(norm, d.Atil, d.A_sm, d.E, visb, ex, sm)
+    a1_row, _, _ = unit_cap(d.Atil, visb, ex, sm)
+    rel_sm = (d.A_sm * d.E).sum(-1); fb = (d.A_sm.sum(-1) - rel_sm) > rel_sm
+    assert bool(fb.any()) and bool((~fb).any())
+    assert torch.equal(a1_fb[fb], a1_row[fb]) and torch.equal(a1_fb[~fb], d.a1[~fb])
+
+
+def test_gradients_flow_through_the_relation_only_cap_and_the_chunked_path_refuses():
+    from marsea.chunked import marsea_chunked_attention
+    norm, Q, K_kv, S, vis, n_p = _setup(rho=0.4, cap_mode="relation", relation_per_head=6)
+    A, d = norm.normalize(S, vis, K_kv, Q, State(), n_prefill=n_p)
+    A.pow(2).sum().backward()
+    assert all(float(dict(norm.named_parameters())[n_].grad.abs().sum()) > 0 for n_ in ("relation.U", "relation.b0", "tauK.fc2.weight", "tauQ.fc2.weight"))
     V = torch.randn(1, K_kv.shape[1], S.shape[-1], D, dtype=DT)
     with pytest.raises(NotImplementedError), torch.no_grad():
         marsea_chunked_attention(norm, Q, K_kv, V, vis, State(), chunk=16)

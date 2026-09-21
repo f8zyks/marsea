@@ -112,6 +112,48 @@ def unit_cap(Atil: torch.Tensor, vis: torch.Tensor, excess: torch.Tensor, sm_mas
     return a1, theta, binds & (theta > 0)
 
 
+def unit_cap_relation(Atil: torch.Tensor, A_sm: torch.Tensor, E: torch.Tensor, excess: torch.Tensor):
+    """STEP 1 fan-in with the excess taken back FROM THE RELATION (cap_mode = "relation"; owner's decision, 2026-09-21).
+
+    The whole-row cap subtracts ONE threshold from every visible entry.  The off-relation part of an answer row is
+    ~3,400 softmax entries each far below that threshold, so wherever the cap binds the whole softmax tail becomes exact
+    zeros (P5, step 900: 0.2 % of it survives on binding rows, and the cap binds on 81 % / 91 % of answer rows at
+    m = 4 / 16) -- although the excess was the relation's doing (the column programme pays it 1.0 -> 1.74 units).
+    Here the off-relation entries stay exactly A_sm and the relation is projected onto ITS OWN softmax mass,
+        budget_i = sum_{j in E_i.} A_sm_ij      ( = 1 - the tail's mass;  >= 0 by construction -- edge case 1 cannot occur )
+    with the same projection (one threshold, exact zeros) restricted to E_i.: the relation redistributes the mass softmax
+    already gave it and cannot borrow from the tail.  Same decision as unit_cap (excess > CAP_TOL, theta > 0 guard), so a
+    cap still never adds mass, never lifts a zero, a1 <= Atil elementwise and a non-binding row is untouched; the row
+    sums to its softmax mass.  The budget is not a constant of the programme: its gradient flows into A_sm."""
+    binds = cap_binds_from_excess(excess)
+    Ef = E.to(Atil.dtype)
+    budget = (A_sm * Ef).sum(-1).clamp_min(0.0)
+    a_rel, theta = proj_le_masked(Atil.masked_fill(~E, 0.0), budget, E, binds=binds)
+    from .primitives import TOL_QUOTA
+    # a relation softmax gave (numerically) NOTHING but the column programme paid: proj_le returns zeros with theta = 0,
+    # which read as "did not bind" and left the row at 1 + its excess.  It binds, and the relation goes to zero.
+    took = binds & ((theta > 0) | (budget <= TOL_QUOTA))
+    a1 = torch.where(took.unsqueeze(-1) & E, a_rel.to(Atil.dtype), Atil)
+    return a1, theta, took
+
+
+def apply_unit_cap(norm, Atil: torch.Tensor, A_sm: torch.Tensor, E: torch.Tensor, vis: torch.Tensor, excess, sm_mass):
+    """the cap the normaliser is configured with -- one entry point for the dense form, the triggered form and decode_step."""
+    mode = getattr(norm, "cap_mode", "row")
+    if mode == "row":
+        return unit_cap(Atil, vis, excess, sm_mass)
+    a1, theta, took = unit_cap_relation(Atil, A_sm, E, excess)
+    if getattr(norm, "cap_fallback_tail_dominates", False):
+        # edge case 2 (owner's question, off by default): where the tail outweighs the relation under softmax, use the
+        # whole-row cap.  NOT recommended: those are the rows the whole-row cap damages most (the tail it zeroes is the
+        # larger part of the row); kept as a switch so a pilot can measure it.
+        rel_sm = (A_sm * E.to(A_sm.dtype)).sum(-1)
+        fb = (A_sm.sum(-1) - rel_sm) > rel_sm
+        a1_w, theta_w, took_w = unit_cap(Atil, vis, excess, sm_mass)
+        a1 = torch.where(fb.unsqueeze(-1), a1_w, a1); theta = torch.where(fb, theta_w, theta); took = torch.where(fb, took_w, took)
+    return a1, theta, took
+
+
 def cap_binds_from_excess(excess: torch.Tensor) -> torch.Tensor:
     """the unit cap's binding set: rows the relation pushed more than CAP_TOL over their softmax mass."""
     return excess > CAP_TOL
@@ -226,7 +268,8 @@ class MarSeaNormalizer(nn.Module):
                  tau_i_pinned: bool = False, tau_j_global: bool = False, quota_mode: str = "inherited",
                  gate: str = "st", per_head: int = 0, hidden: int = 64, K_ret: Optional[int] = None,
                  block_size: int = 512, head_block: Optional[int] = None, head_block_recompute: bool = True,
-                 relation_per_head: int = 0, trigger_tau: bool = False, size_aware_tau_i: bool = False):
+                 relation_per_head: int = 0, trigger_tau: bool = False, size_aware_tau_i: bool = False,
+                 cap_mode: str = "row", cap_fallback_tail_dominates: bool = False):
         super().__init__()
         assert quota_mode in ("inherited", "uniform")
         assert gate in ("st", "hard_concrete")
@@ -252,6 +295,9 @@ class MarSeaNormalizer(nn.Module):
         # (heads.TauKTrigger).  Read by marsea/triggered.py and causal.decode_step; the prompt's one solve keeps TauK.
         from .heads import TauKTrigger
         self.tauK_trig = TauKTrigger(d_head, hidden, tau_min, per_head=per_head) if trigger_tau else None
+        assert cap_mode in ("row", "relation")
+        self.cap_mode = cap_mode                # "relation": Step-1 fan-in takes the excess back from the relation only
+        self.cap_fallback_tail_dominates = bool(cap_fallback_tail_dominates)
         self.st_temperature = 1.0               # straight-through backward temperature; the trainer anneals it to 1
         self.tauK = TauK(d_head, hidden, tau_min, zero_field_inputs=key_only_tau, no_nu=no_nu, per_head=per_head)
         self.tauQ = TauQ(d_head, hidden, tau_min, per_head=per_head, sized=size_aware_tau_i)
@@ -415,7 +461,7 @@ class MarSeaNormalizer(nn.Module):
             # ---- STEP 1 fan-in: cap the WHOLE row at one unit.  NOT a softmax.   (eq:rowstep1)
             one = torch.ones(B, H, n_q, dtype=S32.dtype, device=S.device)
             excess, sm_mass = row_masses(Atil, A_sm, E)                      # decided from the relation, not the row total
-            a1, cap_theta, cap_binds = unit_cap(Atil, vis, excess, sm_mass)  # identity wherever the relation added no mass
+            a1, cap_theta, cap_binds = apply_unit_cap(self, Atil, A_sm, E, vis, excess, sm_mass)   # identity wherever the relation added no mass
             cbar_i = (g * a1).sum(-1)                                        # [B,H,n_q]   ST site (3); POST-cap quota
             Rtil = (Atil * E.to(S32.dtype)).sum(-1)
             # ---- STEP 2 fan-in: ceiling at the quota; TARGET is Atil (PRE-cap)   (eq:rowprog)

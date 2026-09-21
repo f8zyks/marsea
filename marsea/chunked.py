@@ -265,6 +265,8 @@ def _chunked_by_head_block(norm, q, k_kv, v_kv, vis, state, chunk, scaling, forc
 def _marsea_chunked_attention(norm, q, k_kv, v_kv, vis, state=None, chunk=1024, scaling=None, force_empty=False,
                               dense_outputs=False, use_checkpoint=None, dense_head=None, row_block=1024, head_offset=0,
                               want_e8=False):
+    if getattr(norm, "cap_mode", "row") != "row":
+        raise NotImplementedError("cap_mode = relation runs on the dense path only so far (--mode dense)")
     B, H, n_q, d = q.shape
     n_k = k_kv.shape[-2]
     dev = q.device

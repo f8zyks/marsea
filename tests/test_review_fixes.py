@@ -341,7 +341,12 @@ def test_inv5_recomputes_the_binding_set_independently_and_the_cap_uses_no_slack
     assert "* E[..., J]" in inspect.getsource(invariants._masked_excess64)
     assert not hasattr(normalizer, "cap_slack") and normalizer.CAP_TOL == 1e-6
     src_n = inspect.getsource(normalizer.MarSeaNormalizer._normalize_one)
-    assert "row_masses(Atil, A_sm, E)" in src_n and "unit_cap(Atil, vis, excess, sm_mass)" in src_n and "Atil.sum(-1) > 1" not in src_n
+    # 2026-09-21: the call goes through apply_unit_cap (the cap is configurable: whole row | relation only); its "row" mode is
+    # the same unit_cap on the same excess / softmax mass, and no path compares a row sum with a constant
+    import marsea.normalizer as _nz
+    src_cap = inspect.getsource(_nz.apply_unit_cap)
+    assert "row_masses(Atil, A_sm, E)" in src_n and "apply_unit_cap(self, Atil, A_sm, E, vis, excess, sm_mass)" in src_n and "Atil.sum(-1) > 1" not in src_n
+    assert "return unit_cap(Atil, vis, excess, sm_mass)" in src_cap and "cap_binds_from_excess(excess)" in inspect.getsource(_nz.unit_cap_relation)
 
 
 def test_the_unit_cap_is_the_identity_on_a_real_softmax_row_at_length():

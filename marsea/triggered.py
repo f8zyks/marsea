@@ -42,7 +42,7 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
                         **kw):
     """S [B,H,n,n] scaled scores (square: a full teacher-forced pass), rows/keys < n_prefill are the prompt.
     Returns (A [B,H,n,n], Diagnostics) like MarSeaNormalizer._normalize_one."""
-    from .normalizer import Diagnostics, State, broadcast_vis, row_softmax, row_masses, unit_cap
+    from .normalizer import Diagnostics, State, broadcast_vis, row_softmax, row_masses, apply_unit_cap
     assert not kw, f"the triggered form does not take {sorted(kw)}"
     assert norm.quota_mode == "inherited" and abs(norm.alpha - 2.0) < 1e-12 and norm.gate == "st", \
         "the triggered form implements the main arm (inherited quota, sparsemax, straight-through gate)"
@@ -128,7 +128,7 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
         Atil_a = A_sm_a + g_a * (cbar_run * p_a - A_sm_a)                           # ST site 2
         # ---- the row programme, row-local: identical to the dense form's
         excess, sm_mass = row_masses(Atil_a, A_sm_a, E_a)
-        a1_a, cap_theta_a, cap_binds_a = unit_cap(Atil_a, vis_a, excess, sm_mass)
+        a1_a, cap_theta_a, cap_binds_a = apply_unit_cap(norm, Atil_a, A_sm_a, E_a, vis_a, excess, sm_mass)
         cbar_i_a = (g_a * a1_a).sum(-1)                                             # ST site 3
         Rtil_a = (Atil_a * E_a.to(dt)).sum(-1)
         if norm.tau_i_pinned:
