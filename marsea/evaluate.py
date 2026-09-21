@@ -599,7 +599,10 @@ def quick_eval_factory(examples_ruler: list, examples_qa: list, tok, l_star: int
         rows = evaluate_ruler(model, tok, ctx, examples_ruler, l_star, h_star, arm, modes=("teacher",), device=device)
         # 160 new tokens, not the evaluation queue's 32: 32 hold three values, so exact-set was impossible for every m >= 4
         # example and read 0.50 in every pilot whatever the model did (2026-09-21).  A diagnostic; the queue keeps the spec's 32.
-        gen = evaluate_ruler(model, tok, ctx, examples_ruler[:n_gen], l_star, h_star, arm, modes=("generation",), device=device,
+        # spread over the whole list: the files arrive in glob order, and the first 50 examples were the K32_V1 and K32_V4
+        # sets only -- no m = 16 example was ever generated, the one length where the arms differ (2026-09-21)
+        pick = sorted(set(np.linspace(0, len(examples_ruler) - 1, min(n_gen, len(examples_ruler))).round().astype(int).tolist()))
+        gen = evaluate_ruler(model, tok, ctx, [examples_ruler[i] for i in pick], l_star, h_star, arm, modes=("generation",), device=device,
                              max_new_tokens=160)
         agg = aggregate_ruler(rows, stratify=None)[None]
         res = dict(tf_loss=float(np.mean([r["tf_loss"] for r in rows])), exact_set_acc=float(np.mean([r["exact_set"] for r in gen])) if gen else None,
