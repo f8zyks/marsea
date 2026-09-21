@@ -116,6 +116,9 @@ def summarise(recs: list) -> dict:
             out[key] = float(np.mean(vals)) if vals else None
         if out.get("relation_mass_softmax"):                                     # per-row ratios explode where softmax put ~0 on the relation
             out["overpay_ratio"] = out["relation_mass_Atil"] / out["relation_mass_softmax"]
+            out["relation_gain"] = out["relation_mass_final"] / out["relation_mass_softmax"]   # > 1: membership gained mass (needs a tail share)
+        if out.get("tail_mass_softmax"):
+            out["tail_scale"] = out["tail_mass_final"] / out["tail_mass_softmax"]              # 1 - the share of the tail the relation took
         return out
     if not recs:
         return dict(n=0)
@@ -144,6 +147,6 @@ def format_line(step, res: dict) -> str:
     parts = []
     for name, a in [("all", res["all"]), ("first tok", res["first_token"])] + [(f"m={m}", a) for m, a in res["by_m"].items()]:
         parts.append(f"{name}: src in E {f(a['src_in_relation'], 2)} in supp {f(a['src_in_support'], 2)} mass {f(a['src_mass_softmax'], 2)}>{f(a['src_mass_final'], 2)} "
-                     f"| |E_i| {f(a['relation_size'], 0)} overpay x{f(a['overpay_ratio'], 2)} cap {f(a['cap_binds'], 2)} tail kept {f(a['tail_kept_frac'], 2)} "
+                     f"| |E_i| {f(a['relation_size'], 0)} overpay x{f(a['overpay_ratio'], 2)} cap {f(a['cap_binds'], 2)} tail kept {f(a['tail_kept_frac'], 2)} x{f(a.get('tail_scale'), 2)} rel gain x{f(a.get('relation_gain'), 2)} "
                      f"| col size {f(a['col_size'], 0)} share {f(a['row_share_p'], 2)} tau {f(a['tau_used'], 2)} standing {f(a['row_standing'], 2)}")
     return f"[monitor] step {step}  " + "  ||  ".join(parts)

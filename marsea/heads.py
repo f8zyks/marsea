@@ -243,3 +243,31 @@ class TauQ(_Head):
     def forward(self, q: torch.Tensor, summary: torch.Tensor, head_offset: int = 0) -> torch.Tensor:
         x = torch.cat([self.ln(_fp(q)), feat(_fp(summary))], dim=-1)
         return self.tau_min + F.softplus(self._mlp(x, head_offset))
+
+
+class TailShare(_Head):
+    """lambda_i = lambda_max * sigmoid(MLP(LN(q_i), f(pre-cap row summary))) -- the share of the row's OFF-relation softmax
+    mass the relation may take in fan-in step 1 (cap_mode = "relation"; owner's decision, 2026-09-21).  It sits in TauQ's
+    place in the circuit (per row, per Q-head with `per_head`) but reads the row BEFORE the cap, since it decides the cap:
+      (Rtil_i = what the column programme paid the relation,  the relation's softmax mass,  max of Atil,  entropy of Atil
+       on E_i.,  the tail's softmax mass)  +  row_relation_stats (8)
+    Initialised at lambda_init (small): Phase B starts next to the relation-only cap that lambda = 0 is."""
+    N_SCALAR = 5 + 8
+
+    def __init__(self, d_head: int, hidden: int = 64, lam_max: float = 0.5, lam_init: float = 0.05, per_head: int = 0):
+        super().__init__(d_head, self.N_SCALAR, hidden, 0.0, 1.0, per_head)
+        assert 0.0 < lam_init < lam_max <= 1.0
+        self.lam_max = float(lam_max)
+        r = lam_init / lam_max
+        self.last_bias.data.fill_(math.log(r / (1.0 - r)))
+
+    @staticmethod
+    def summary(Atil, A_sm, E, vis, col_size, p) -> torch.Tensor:
+        Ef = E.to(Atil.dtype)
+        Rtil = (Atil * Ef).sum(-1); R_sm = (A_sm * Ef).sum(-1); M_T = (A_sm * (1.0 - Ef)).sum(-1)
+        return torch.cat([row_summary(Atil, E, vis, R_sm, Rtil), M_T.unsqueeze(-1), row_relation_stats(Atil, E, col_size, p)], dim=-1)
+
+    def forward(self, q: torch.Tensor, summary: torch.Tensor, head_offset: int = 0) -> torch.Tensor:
+        x = torch.cat([self.ln(_fp(q)), feat(_fp(summary))], dim=-1)
+        return self.lam_max * torch.sigmoid(self._mlp(x, head_offset))
+

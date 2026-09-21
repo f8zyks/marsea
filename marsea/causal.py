@@ -279,7 +279,8 @@ def decode_step(norm: MarSeaNormalizer, cache: FrozenPrefixCache, S_row: torch.T
     one = torch.ones(B, H, 1, dtype=S32.dtype, device=S32.device)
     excess, sm_mass = row_masses(Atil_row, A_sm, E_row)                          # the same cap as the dense path
     from .normalizer import apply_unit_cap
-    a1, cap_theta, cap_binds = apply_unit_cap(norm, Atil_row, A_sm, E_row, vis, excess, sm_mass)
+    a1, cap_theta, cap_binds = apply_unit_cap(norm, Atil_row, A_sm, E_row, vis, excess, sm_mass, Q=q_t, col_size=cache.rel_count,
+                                             p=p_new.unsqueeze(-2))
     Ef = E_row.to(S32.dtype)
     cbar_i = (a1 * Ef).sum(-1)
     Rtil = (Atil_row * Ef).sum(-1)

@@ -21,6 +21,8 @@ def _setup(T=44, n_p=30, H=(2, 3), rho=0.3, seed=0, **kw):
         for p_ in norm.tauQ.parameters(): p_.add_((0.3 if norm.tauQ.sized else 0.05) * torch.randn_like(p_))
         if norm.tauK_trig is not None:
             for p_ in norm.tauK_trig.parameters(): p_.add_(0.3 * torch.randn_like(p_))   # a trigger-time tau that really varies
+        if norm.tail_share_head is not None:
+            for p_ in norm.tail_share_head.parameters(): p_.add_(0.5 * torch.randn_like(p_))   # a tail share that really varies
     return norm, Q, K_kv, S, vis, n_p
 
 
@@ -42,6 +44,8 @@ def _by_decoding(norm, Q, K_kv, S, vis, n_p, K_ret):
                                       (64, dict(size_aware_tau_i=True)), (3, dict(size_aware_tau_i=True, trigger_tau=True)),
                                       (64, dict(size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2)),
                                       (64, dict(cap_mode="relation")), (3, dict(cap_mode="relation")),
+                                      (64, dict(cap_mode="relation", tail_share=0.3)), (3, dict(cap_mode="relation", tail_share_learned=True)),
+                                      (64, dict(cap_mode="relation", tail_share_learned=True, size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2)),
                                       (64, dict(cap_mode="relation", size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2))])
 def test_triggered_equals_prefill_plus_decode(K_ret, kw):
     norm, Q, K_kv, S, vis, n_p = _setup(**kw)
@@ -273,3 +277,54 @@ def test_a_padded_slot_on_a_column_the_row_cannot_see_does_not_poison_the_gradie
     bad = [n_ for n_, p_ in norm.named_parameters() if p_.grad is not None and not bool(torch.isfinite(p_.grad).all())]
     assert bad == [] and bool(torch.isfinite(Q.grad).all()), bad
     assert float(norm.tauK_trig.fc2.weight.grad.abs().sum()) > 0
+
+
+def test_a_tail_share_lets_the_relation_keep_mass_and_scales_the_tail_without_a_zero():
+    """owner's decision, 2026-09-21: budget = R + lambda T; the tail pays for what the relation kept by ONE factor per row."""
+    lam = 0.3
+    norm, d, vis = _capped("relation", tail_share=lam)
+    _, d0, _ = _capped("relation")                                                        # lambda = 0: same relation, same Atil
+    assert torch.equal(d.E, d0.E) and torch.equal(d.Atil, d0.Atil)
+    visb = vis.expand_as(d.E); off = visb & ~d.E; Ef = d.E.to(DT)
+    R = (d.A_sm * Ef).sum(-1); T_ = (d.A_sm * off).sum(-1); W = (d.Atil * Ef).sum(-1); rel = (d.a1 * Ef).sum(-1); ex = W - R
+    over = ex > 1e-9
+    assert int(d.cap_binds.sum()) > 5 and int((over & ~d.cap_binds).sum()) > 5, "needs rows in BOTH over-paid regimes"
+    # the tail: one factor per row, in [1 - lambda, 1]; its support is untouched (nothing is thresholded)
+    fac = (d.a1 * off).sum(-1) / T_.clamp_min(1e-300)
+    assert float((d.a1 - d.A_sm * fac.unsqueeze(-1))[off].abs().max()) < 1e-12
+    assert float(fac[T_ > 0].min()) >= 1 - lam - 1e-9 and float(fac[T_ > 0].max()) <= 1 + 1e-12
+    assert torch.equal((d.a1 > 0) & off, (d.A_sm > 0) & off)
+    # the relation: within its budget, above its softmax mass wherever it was over-paid -- membership can now GAIN mass
+    assert bool((rel <= R + lam * T_ + 1e-9).all()) and bool((rel[over & (T_ > 1e-6)] > R[over & (T_ > 1e-6)]).all())
+    b = d.cap_binds
+    assert float((rel[b] - (R + lam * T_)[b]).abs().max()) < 1e-9                          # projected onto the budget ...
+    assert bool(((d.a1 == 0) & (d.Atil > 0) & d.E)[b].any())                               # ... with exact zeros ON the relation
+    mid = over & ~b
+    assert torch.equal(d.a1[mid][d.E[mid]], d.Atil[mid][d.E[mid]])                         # in between: the relation keeps Atil whole
+    assert float((d.a1.sum(-1) - d.A_sm.sum(-1))[over].abs().max()) < 1e-9                 # the row: its softmax mass
+    assert torch.equal(d.a1[~over], d.Atil[~over])                                         # not over-paid: untouched
+    assert bool((d.a1 <= d.Atil + 1e-15).all())                                            # a cap never adds mass
+    assert int(b.sum()) < int(d0.cap_binds.sum())                                          # fewer rows are projected than at lambda = 0
+    # continuity in lambda: a vanishing share is the relation-only cap
+    _, d_eps, _ = _capped("relation", tail_share=1e-9)
+    assert float((d_eps.a1 - d0.a1).abs().max()) < 1e-7
+
+
+def test_the_learned_tail_share_is_bounded_starts_small_trains_and_needs_the_relation_cap():
+    from marsea.heads import TailShare
+    from marsea.normalizer import MarSeaNormalizer
+    h = TailShare(D, lam_max=0.5, lam_init=0.05, per_head=6).to(DT)
+    lam = h(torch.randn(1, 6, 9, D, dtype=DT), torch.randn(1, 6, 9, TailShare.N_SCALAR, dtype=DT).abs())
+    assert float(lam.min()) > 0 and float(lam.max()) < 0.5 and abs(float(lam.mean()) - 0.05) < 0.01
+    with pytest.raises(AssertionError):
+        MarSeaNormalizer(D, R, tail_share=0.2)                                             # cap_mode = "row"
+    with pytest.raises(AssertionError):
+        MarSeaNormalizer(D, R, cap_mode="relation", tail_share=0.2, tail_share_learned=True)
+    norm, Q, K_kv, S, vis, n_p = _setup(rho=0.4, cap_mode="relation", tail_share_learned=True, relation_per_head=6, per_head=6)
+    A, d = norm.normalize(S, vis, K_kv, Q, State(), n_prefill=n_p)
+    A.pow(2).sum().backward()
+    g = dict(norm.named_parameters())
+    assert all(float(g[n_].grad.abs().sum()) > 0 for n_ in ("tail_share_head.w1", "tail_share_head.w2", "tail_share_head.b2", "relation.U"))
+    w, o = norm.new_module_params()
+    assert any(p_ is g["tail_share_head.w1"] for p_ in w) and any(p_ is g["tail_share_head.b2"] for p_ in o)
+

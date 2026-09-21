@@ -92,7 +92,8 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
         L_v = torch.cat([torch.cat([v0, L_v[:, :, :n_p, k0:]], -1), L_v[:, :, n_p:]], -2)
         S_aT = S_a.transpose(-1, -2); E_aT = E_a.transpose(-1, -2)                  # [B,H,n,m]: the answer rows of each key
         trig_tau = getattr(norm, "tauK_trig", None)
-        if trig_tau is not None or norm.tauQ.sized:                                 # the TRUE size of each relation set, row by row
+        learned_share = getattr(norm, "tail_share_head", None) is not None
+        if trig_tau is not None or norm.tauQ.sized or learned_share:                                 # the TRUE size of each relation set, row by row
             cnt_run = torch.cat([d_p.E.sum(-2), torch.zeros(B, H, m, dtype=torch.long, device=dev)], -1).unsqueeze(-2) + torch.cumsum(E_a.long(), dim=-2)
         if trig_tau is not None:
             k_all = repeat_kv(_fp(K_kv), g_kv)                                      # [B,H,n,d]
@@ -133,7 +134,8 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
         Atil_a = A_sm_a + g_a * (cbar_run * p_a - A_sm_a)                           # ST site 2
         # ---- the row programme, row-local: identical to the dense form's
         excess, sm_mass = row_masses(Atil_a, A_sm_a, E_a)
-        a1_a, cap_theta_a, cap_binds_a = apply_unit_cap(norm, Atil_a, A_sm_a, E_a, vis_a, excess, sm_mass)
+        a1_a, cap_theta_a, cap_binds_a = apply_unit_cap(norm, Atil_a, A_sm_a, E_a, vis_a, excess, sm_mass, Q=Q[:, :, n_p:],
+                                                        col_size=cnt_run if learned_share else None, p=p_a, head_offset=head_offset)
         cbar_i_a = (g_a * a1_a).sum(-1)                                             # ST site 3
         Rtil_a = (Atil_a * E_a.to(dt)).sum(-1)
         if norm.tau_i_pinned:

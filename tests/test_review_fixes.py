@@ -345,7 +345,7 @@ def test_inv5_recomputes_the_binding_set_independently_and_the_cap_uses_no_slack
     # the same unit_cap on the same excess / softmax mass, and no path compares a row sum with a constant
     import marsea.normalizer as _nz
     src_cap = inspect.getsource(_nz.apply_unit_cap)
-    assert "row_masses(Atil, A_sm, E)" in src_n and "apply_unit_cap(self, Atil, A_sm, E, vis, excess, sm_mass)" in src_n and "Atil.sum(-1) > 1" not in src_n
+    assert "row_masses(Atil, A_sm, E)" in src_n and "apply_unit_cap(self, Atil, A_sm, E, vis, excess, sm_mass, Q=Q" in src_n and "Atil.sum(-1) > 1" not in src_n
     assert "return unit_cap(Atil, vis, excess, sm_mass)" in src_cap and "cap_binds_from_excess(excess)" in inspect.getsource(_nz.unit_cap_relation)
 
 
