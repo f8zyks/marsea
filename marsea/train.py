@@ -773,6 +773,11 @@ def train(cfg: TrainConfig, data, quick_eval=None, monitor=None):
             key = step; nan_count[key] = nan_count.get(key, 0) + 1
             readme["events"].append(dict(step=step, event="nan", count=nan_count[key], detail=str(e)))
             print(f"[NaN] at step {step} ({nan_count[key]}): {e}")
+            if nan_count[key] == 1:
+                # the weights are untouched (the optimiser never stepped): keep them, with the window's cursor, so the
+                # failure can be replayed on one sequence instead of re-running from the last checkpoint
+                opt.zero_grad(set_to_none=True)
+                save_checkpoint(run_dir / f"nan_step{step}.pt", model, None, step, cursor, cfg, extra={"phase": "B", "nan": str(e)})
             if nan_count[key] >= 3:
                 readme["events"].append(dict(step=step, event="stopped: third NaN"))
                 (run_dir / "README.json").write_text(json.dumps(readme, indent=1, default=str))
@@ -830,6 +835,14 @@ def train(cfg: TrainConfig, data, quick_eval=None, monitor=None):
     return model, tok, ctx
 
 
+def nonfinite_grad_names(model) -> list:
+    """names of the parameters whose .grad holds a NaN / inf (one fused check, names only on failure)."""
+    named = [(n, p.grad) for n, p in model.named_parameters() if p.grad is not None]
+    if not named or bool(torch.isfinite(torch.stack([g.float().abs().sum() for _, g in named])).all()):
+        return []
+    return [n for n, g in named if not bool(torch.isfinite(g).all())]
+
+
 def train_step(model, ctx, opt, data, cursor, step, cfg, log, head_lr_scale=1.0):
     dev = cfg.device
     opt.zero_grad(set_to_none=True)
@@ -854,6 +867,13 @@ def train_step(model, ctx, opt, data, cursor, step, cfg, log, head_lr_scale=1.0)
         assert not torch.is_autocast_enabled(), "backward under autocast: the programs' gradients would run in bf16"
         (loss_tok / tokens_in_window).backward()
         loss_sum += float(loss_tok.detach())
+        # a finite loss with a non-finite GRADIENT used to surface only after the whole window, as one norm, with nothing
+        # to say which sequence or which parameter (P7, step 751, 2026-09-21: three identical retries and no lead).  Checked
+        # per micro-batch -- a few hundred small tensors against a ~1 s forward/backward -- and named.
+        bad = nonfinite_grad_names(model)
+        if bad:
+            raise NaNError(f"non-finite gradient at step {step} micro {micro} (cursor {cursor + micro}, source {s.source}, "
+                           f"n {ids.shape[1]}, n_prefill {ctx.n_prefill}, loss {float(loss_tok.detach()):.4f}): {len(bad)} parameters, first {bad[:8]}")
         if ctx.collect:
             # F-2 (read-through 2026-09-11): the model's forward pre-hook calls ctx.reset_forward on EVERY forward, which
             # clears ctx.diags -- so micro-batches 1..15 wipe what micro 0 collected and e8_summary() saw {}.  Snapshot the

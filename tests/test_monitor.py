@@ -1,5 +1,5 @@
 """The relation monitor: per answer row, the ONE key it is about to copy -- on a tiny model, both training forms."""
-import math, torch, pytest
+import math, pathlib, torch, pytest
 from types import SimpleNamespace
 from test_triggered import _tiny_model
 
@@ -50,3 +50,18 @@ def test_train_calls_the_monitor_on_its_cadence():
     import inspect, marsea.train as tr
     src = inspect.getsource(tr.train)
     assert "cfg.monitor_every and (step - cfg.phase_a_steps) % cfg.monitor_every == 0" in src and "log(dict(step=step, monitor=mres))" in src
+
+
+def test_a_non_finite_gradient_is_named_by_parameter():
+    """P7 (2026-09-21) stopped on 'non-finite gradient norm at step 751' three times with nothing to say where: the check
+    now runs per micro-batch and names the parameters; the training loop keeps the weights (nan_step{step}.pt)."""
+    import torch
+    from marsea.train import nonfinite_grad_names
+    m = torch.nn.Sequential(torch.nn.Linear(3, 3), torch.nn.Linear(3, 1))
+    assert nonfinite_grad_names(m) == []                                       # no gradients at all
+    m(torch.ones(2, 3)).sum().backward()
+    assert nonfinite_grad_names(m) == []
+    m[1].weight.grad[0, 1] = float("nan"); m[0].bias.grad[2] = float("inf")
+    assert nonfinite_grad_names(m) == ["0.bias", "1.weight"]
+    src = (pathlib.Path(__file__).resolve().parents[1] / "marsea/train.py").read_text()
+    assert 'nan_step{step}.pt' in src and "nonfinite_grad_names(model)" in src

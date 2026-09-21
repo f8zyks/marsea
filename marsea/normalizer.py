@@ -142,16 +142,7 @@ def apply_unit_cap(norm, Atil: torch.Tensor, A_sm: torch.Tensor, E: torch.Tensor
     mode = getattr(norm, "cap_mode", "row")
     if mode == "row":
         return unit_cap(Atil, vis, excess, sm_mass)
-    a1, theta, took = unit_cap_relation(Atil, A_sm, E, excess)
-    if getattr(norm, "cap_fallback_tail_dominates", False):
-        # edge case 2 (owner's question, off by default): where the tail outweighs the relation under softmax, use the
-        # whole-row cap.  NOT recommended: those are the rows the whole-row cap damages most (the tail it zeroes is the
-        # larger part of the row); kept as a switch so a pilot can measure it.
-        rel_sm = (A_sm * E.to(A_sm.dtype)).sum(-1)
-        fb = (A_sm.sum(-1) - rel_sm) > rel_sm
-        a1_w, theta_w, took_w = unit_cap(Atil, vis, excess, sm_mass)
-        a1 = torch.where(fb.unsqueeze(-1), a1_w, a1); theta = torch.where(fb, theta_w, theta); took = torch.where(fb, took_w, took)
-    return a1, theta, took
+    return unit_cap_relation(Atil, A_sm, E, excess)
 
 
 def cap_binds_from_excess(excess: torch.Tensor) -> torch.Tensor:
@@ -269,7 +260,7 @@ class MarSeaNormalizer(nn.Module):
                  gate: str = "st", per_head: int = 0, hidden: int = 64, K_ret: Optional[int] = None,
                  block_size: int = 512, head_block: Optional[int] = None, head_block_recompute: bool = True,
                  relation_per_head: int = 0, trigger_tau: bool = False, size_aware_tau_i: bool = False,
-                 cap_mode: str = "row", cap_fallback_tail_dominates: bool = False):
+                 cap_mode: str = "row"):
         super().__init__()
         assert quota_mode in ("inherited", "uniform")
         assert gate in ("st", "hard_concrete")
@@ -297,7 +288,6 @@ class MarSeaNormalizer(nn.Module):
         self.tauK_trig = TauKTrigger(d_head, hidden, tau_min, per_head=per_head) if trigger_tau else None
         assert cap_mode in ("row", "relation")
         self.cap_mode = cap_mode                # "relation": Step-1 fan-in takes the excess back from the relation only
-        self.cap_fallback_tail_dominates = bool(cap_fallback_tail_dominates)
         self.st_temperature = 1.0               # straight-through backward temperature; the trainer anneals it to 1
         self.tauK = TauK(d_head, hidden, tau_min, zero_field_inputs=key_only_tau, no_nu=no_nu, per_head=per_head)
         self.tauQ = TauQ(d_head, hidden, tau_min, per_head=per_head, sized=size_aware_tau_i)
