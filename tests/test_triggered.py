@@ -18,7 +18,7 @@ def _setup(T=44, n_p=30, H=(2, 3), rho=0.3, seed=0, **kw):
     with torch.no_grad():
         norm.relation.calibrate_b0(K_kv, Q, vis, rho)
         for p_ in norm.tauK.parameters(): p_.add_(0.05 * torch.randn_like(p_))      # tau heads that actually vary
-        for p_ in norm.tauQ.parameters(): p_.add_(0.05 * torch.randn_like(p_))
+        for p_ in norm.tauQ.parameters(): p_.add_((0.3 if norm.tauQ.sized else 0.05) * torch.randn_like(p_))
         if norm.tauK_trig is not None:
             for p_ in norm.tauK_trig.parameters(): p_.add_(0.3 * torch.randn_like(p_))   # a trigger-time tau that really varies
     return norm, Q, K_kv, S, vis, n_p
@@ -38,7 +38,9 @@ def _by_decoding(norm, Q, K_kv, S, vis, n_p, K_ret):
 
 @pytest.mark.parametrize("K_ret,kw", [(64, {}), (3, {}), (64, dict(relation_per_head=6, per_head=6)), (64, dict(head_block=2)),
                                       (64, dict(tau_i_pinned=True)), (64, dict(trigger_tau=True)), (3, dict(trigger_tau=True)),
-                                      (64, dict(trigger_tau=True, relation_per_head=6, per_head=6, head_block=2))])
+                                      (64, dict(trigger_tau=True, relation_per_head=6, per_head=6, head_block=2)),
+                                      (64, dict(size_aware_tau_i=True)), (3, dict(size_aware_tau_i=True, trigger_tau=True)),
+                                      (64, dict(size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2))])
 def test_triggered_equals_prefill_plus_decode(K_ret, kw):
     norm, Q, K_kv, S, vis, n_p = _setup(**kw)
     A_p, A_dec = _by_decoding(norm, Q, K_kv, S, vis, n_p, K_ret)
@@ -91,7 +93,7 @@ def test_nu_handoff_is_the_prefills_for_prompt_keys_and_one_for_answer_keys():
 
 
 # ------------------------------------------------------------------------------------------ the whole model
-def _tiny_model(head_block=None):
+def _tiny_model(head_block=None, sized=True):
     from transformers import Qwen2Config, Qwen2ForCausalLM
     from marsea.backbone import patch_model, MarSeaContext
     from marsea.baselines import make_normalizer
@@ -102,12 +104,12 @@ def _tiny_model(head_block=None):
     ctx = MarSeaContext(mode="dense")
     torch.manual_seed(1)
     patch_model(model, [1, 2], lambda l: make_normalizer("marsea", 8, head_block=head_block, relation_per_head=8, per_head=8,
-                                                         trigger_tau=True).double(), ctx)
+                                                         trigger_tau=True, size_aware_tau_i=sized).double(), ctx)
     with torch.no_grad():
         for l in (1, 2):
             nm = model.model.layers[l].self_attn.normalizer
             nm.relation.b0.fill_(0.0)                                          # about half of the pairs: a relation that acts
-            for p_ in nm.tauK_trig.parameters(): p_.add_(0.3 * torch.randn_like(p_))
+            for p_ in list(nm.tauK_trig.parameters()) + list(nm.tauQ.parameters()): p_.add_(0.3 * torch.randn_like(p_))
     model.marsea_ctx = ctx; model.eval()
     return model, ctx
 
@@ -140,7 +142,7 @@ def test_teacher_forced_logits_equal_cached_decoding_step_by_step(hb):
 
 
 def test_the_chunked_path_refuses_rather_than_silently_running_the_leaky_form():
-    model, ctx = _tiny_model()
+    model, ctx = _tiny_model(sized=False)
     ctx.mode = "chunked"; ctx.triggered = True; ctx.n_prefill = 20
     with pytest.raises(NotImplementedError), torch.no_grad():
         model(input_ids=torch.randint(0, 97, (1, 32)), use_cache=False)
@@ -182,3 +184,25 @@ def test_the_trigger_time_tau_is_used_changes_the_answer_rows_only_and_gets_grad
 def test_phase_b_init_starts_the_trigger_head_at_tauKs_calibrated_bias():
     import inspect, marsea.train as tr
     assert "nm.tauK_trig.last_bias.data.copy_(nm.tauK.last_bias.data)" in inspect.getsource(tr.phase_b_init)
+
+
+# ------------------------------------------------------------------------------------------ the size-aware tau_i
+def test_row_relation_stats_reads_the_rows_relation_set_and_its_columns():
+    from marsea.heads import row_relation_stats
+    Atil = torch.tensor([[[[0.5, 0.1, 0.3, 0.0], [0.2, 0.0, 0.0, 0.0]]]], dtype=DT)          # [1,1,2,4]
+    E = torch.tensor([[[[True, True, True, False], [False, False, False, False]]]])
+    st = row_relation_stats(Atil, E, torch.tensor([[[10, 2, 4, 9]]]), torch.full((1, 1, 2, 4), 0.5, dtype=DT))
+    size, mx, gap, mean, std, cmean, cmax, share = st[0, 0, 0].tolist()
+    assert (size, mx, cmax, share) == (3.0, 0.5, 10.0, 0.5) and abs(gap - 0.2) < 1e-12 and abs(mean - 0.3) < 1e-12 and abs(cmean - 16 / 3) < 1e-12
+    assert abs(std - (((0.2 ** 2 + 0.2 ** 2 + 0.0) / 3) ** 0.5)) < 1e-6
+    assert st[0, 0, 1].tolist()[:4] == [0.0, 0.0, 0.0, 0.0]                                   # an empty relation set: zeros, no NaN
+    assert bool(torch.isfinite(st).all())
+
+
+def test_the_size_aware_tau_i_sees_twelve_scalars_and_the_chunked_path_refuses():
+    from marsea.chunked import marsea_chunked_attention
+    norm, Q, K_kv, S, vis, n_p = _setup(size_aware_tau_i=True)
+    assert norm.tauQ.sized and norm.tauQ.fc1.in_features == D + 12 and MarSeaNormalizer(D, R).tauQ.fc1.in_features == D + 4
+    V = torch.randn(1, K_kv.shape[1], S.shape[-1], D, dtype=DT)
+    with pytest.raises(NotImplementedError), torch.no_grad():
+        marsea_chunked_attention(norm, Q, K_kv, V, vis, State(), chunk=16)

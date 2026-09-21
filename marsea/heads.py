@@ -76,6 +76,25 @@ def row_summary(Atil: torch.Tensor, E: torch.Tensor, vis: torch.Tensor, cbar_i: 
     return torch.stack([Rtil, cbar_i, mx, ent], dim=-1)
 
 
+def row_relation_stats(Atil: torch.Tensor, E: torch.Tensor, col_size: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+    """-> [B,H,n_q,8]: what a row's relation set looks like when its row programme runs (owner's proposal, 2026-09-21):
+      (|E_i.|, max / max - second / mean / std of Atil on E_i.,  mean and max SIZE of the columns the row belongs to,
+       the row's mean share p in them)
+    col_size [B,H,n_k] (one size per column) or [B,H,n_q,n_k] (the size when THAT row triggered it).  One function for the
+    dense form, the triggered form and decode_step.  Hard E, like row_summary."""
+    A = _fp(Atil); Eb = E.bool(); Ef = Eb.to(A.dtype)
+    n = Ef.sum(-1)
+    top = A.masked_fill(~Eb, float("-inf")).topk(min(2, A.shape[-1]), dim=-1).values
+    mx = torch.where(n > 0, top[..., 0], torch.zeros_like(n))
+    second = torch.where(n > 1, top[..., -1], mx)
+    mean = (A * Ef).sum(-1) / n.clamp_min(1.0)
+    std = ((((A - mean.unsqueeze(-1)) ** 2) * Ef).sum(-1) / n.clamp_min(1.0) + 1e-12).sqrt()
+    cs = _fp(col_size); cs = cs.unsqueeze(-2) if cs.dim() == A.dim() - 1 else cs
+    cmean = (cs * Ef).sum(-1) / n.clamp_min(1.0); cmax = (cs * Ef).amax(-1)
+    share = (_fp(p) * Ef).sum(-1) / n.clamp_min(1.0)
+    return torch.stack([n, mx, mx - second, mean, std, cmean, cmax, share], dim=-1)
+
+
 class _Head(nn.Module):
     def __init__(self, d_head: int, n_scalar: int, hidden: int, tau_min: float, init_tau: float,
                  per_head: int = 0):
@@ -210,8 +229,16 @@ class TauQ(_Head):
     """tau_i = tau_min + softplus(MLP(LN(q_i), f(row_summary_i))).  Init tau_i = 1: the identity on step 1's row."""
 
     def __init__(self, d_head: int, hidden: int = 64, tau_min: float = TAU_MIN, init_tau: float = 1.0,
-                 per_head: int = 0):
-        super().__init__(d_head, 4, hidden, tau_min, init_tau, per_head)
+                 per_head: int = 0, sized: bool = False):
+        # sized: the summary carries row_relation_stats too (4 + 8 scalars) -- a tau_i that can see how large the row's
+        # relation set is, how peaked it is and how crowded its columns are.  It shapes the RELATION part of the row
+        # (s_i = cbar_i / tau_i); the off-relation tail is the unit cap's business, not tau_i's.
+        super().__init__(d_head, 12 if sized else 4, hidden, tau_min, init_tau, per_head)
+        self.sized = bool(sized)
+
+    def summary(self, Atil, E, vis, cbar_i, Rtil, col_size=None, p=None) -> torch.Tensor:
+        s = row_summary(Atil, E, vis, cbar_i, Rtil)
+        return torch.cat([s, row_relation_stats(Atil, E, col_size, p)], dim=-1) if self.sized else s
 
     def forward(self, q: torch.Tensor, summary: torch.Tensor, head_offset: int = 0) -> torch.Tensor:
         x = torch.cat([self.ln(_fp(q)), feat(_fp(summary))], dim=-1)

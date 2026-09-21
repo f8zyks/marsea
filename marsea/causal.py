@@ -285,7 +285,7 @@ def decode_step(norm: MarSeaNormalizer, cache: FrozenPrefixCache, S_row: torch.T
     if norm.tau_i_pinned:
         tau_i = one
     else:
-        tau_i = norm.tauQ(_fp(q_t), row_summary(Atil_row, E_row, vis, cbar_i, Rtil))
+        tau_i = norm.tauQ(_fp(q_t), norm.tauQ.summary(Atil_row, E_row, vis, cbar_i, Rtil, col_size=cache.rel_count, p=p_new.unsqueeze(-2)))
     u, theta = proj_le_masked(Atil_row.masked_fill(~E_row, 0.0), cbar_i / tau_i, E_row)
     A_row = torch.where(E_row, tau_i.unsqueeze(-1) * u, a1)
     cache.n_seen = t + 1

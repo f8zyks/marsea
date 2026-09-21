@@ -483,6 +483,8 @@ def _marsea_chunked_attention(norm, q, k_kv, v_kv, vis, state=None, chunk=1024, 
     if norm.tau_i_pinned:
         tau_i = torch.ones(B, H, n_q, dtype=dt, device=dev)
     else:
+        if norm.tauQ.sized:
+            raise NotImplementedError("size_aware_tau_i runs on the dense path only so far (--mode dense)")
         tau_i = norm.tauQ(_fp(q), summary, head_offset)
     tau_i_flat = tau_i.reshape(-1)
     # ragged proj_le on the relation rows: pad to [n_active_rows, L_max]

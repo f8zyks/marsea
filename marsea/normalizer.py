@@ -226,7 +226,7 @@ class MarSeaNormalizer(nn.Module):
                  tau_i_pinned: bool = False, tau_j_global: bool = False, quota_mode: str = "inherited",
                  gate: str = "st", per_head: int = 0, hidden: int = 64, K_ret: Optional[int] = None,
                  block_size: int = 512, head_block: Optional[int] = None, head_block_recompute: bool = True,
-                 relation_per_head: int = 0, trigger_tau: bool = False):
+                 relation_per_head: int = 0, trigger_tau: bool = False, size_aware_tau_i: bool = False):
         super().__init__()
         assert quota_mode in ("inherited", "uniform")
         assert gate in ("st", "hard_concrete")
@@ -254,7 +254,7 @@ class MarSeaNormalizer(nn.Module):
         self.tauK_trig = TauKTrigger(d_head, hidden, tau_min, per_head=per_head) if trigger_tau else None
         self.st_temperature = 1.0               # straight-through backward temperature; the trainer anneals it to 1
         self.tauK = TauK(d_head, hidden, tau_min, zero_field_inputs=key_only_tau, no_nu=no_nu, per_head=per_head)
-        self.tauQ = TauQ(d_head, hidden, tau_min, per_head=per_head)
+        self.tauQ = TauQ(d_head, hidden, tau_min, per_head=per_head, sized=size_aware_tau_i)
         if tau_j_global:
             from .heads import inv_softplus
             self.tau_j_raw = nn.Parameter(torch.tensor(inv_softplus(1.0 - tau_min)))
@@ -424,7 +424,7 @@ class MarSeaNormalizer(nn.Module):
             elif self.tau_i_pinned:
                 tau_i = one
             else:
-                summ = row_summary(Atil, E, vis, cbar_i, Rtil)
+                summ = self.tauQ.summary(Atil, E, vis, cbar_i, Rtil, col_size=E.sum(-2), p=p)
                 tau_i = self.tauQ(_fp(Q), summ, head_offset)                 # [B,H,n_q]
             s_i = cbar_i / tau_i                                             # tau_i > tau_min > 0
             u, theta = proj_le_masked(Atil.masked_fill(~E, 0.0), s_i, E)     # <=, never proj_eq; u = 0 off E

@@ -91,8 +91,9 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
         L_v = torch.cat([torch.cat([v0, L_v[:, :, :n_p, k0:]], -1), L_v[:, :, n_p:]], -2)
         S_aT = S_a.transpose(-1, -2); E_aT = E_a.transpose(-1, -2)                  # [B,H,n,m]: the answer rows of each key
         trig_tau = getattr(norm, "tauK_trig", None)
-        if trig_tau is not None:                                                    # the TRUE size of each relation set, row by row
+        if trig_tau is not None or norm.tauQ.sized:                                 # the TRUE size of each relation set, row by row
             cnt_run = torch.cat([d_p.E.sum(-2), torch.zeros(B, H, m, dtype=torch.long, device=dev)], -1).unsqueeze(-2) + torch.cumsum(E_a.long(), dim=-2)
+        if trig_tau is not None:
             k_all = repeat_kv(_fp(K_kv), g_kv)                                      # [B,H,n,d]
         p_rows = []; tau_rows = []
         for r0 in range(0, m, row_block):
@@ -133,7 +134,7 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
         if norm.tau_i_pinned:
             tau_i_a = torch.ones(B, H, m, dtype=dt, device=dev)
         else:
-            tau_i_a = norm.tauQ(_fp(Q[:, :, n_p:]), row_summary(Atil_a, E_a, vis_a, cbar_i_a, Rtil_a), head_offset)
+            tau_i_a = norm.tauQ(_fp(Q[:, :, n_p:]), norm.tauQ.summary(Atil_a, E_a, vis_a, cbar_i_a, Rtil_a, col_size=cnt_run if norm.tauQ.sized else None, p=p_a), head_offset)
         u_a, theta_a = proj_le_masked(Atil_a.masked_fill(~E_a, 0.0), cbar_i_a / tau_i_a, E_a)
         A_a = a1_a + g_a * (tau_i_a.unsqueeze(-1) * u_a - a1_a)                     # ST site 4
         # ---- the hand-off to the next patched layer: the prefill's nu for the prompt keys, 1 for a key sealed at arrival
