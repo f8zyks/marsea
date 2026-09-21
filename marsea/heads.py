@@ -235,6 +235,14 @@ class TauQ(_Head):
         # (s_i = cbar_i / tau_i); the off-relation tail is the unit cap's business, not tau_i's.
         super().__init__(d_head, 12 if sized else 4, hidden, tau_min, init_tau, per_head)
         self.sized = bool(sized)
+        # a FLOORED tau_i (tau_min >= 1; normaliser kwarg tau_i_floor): it cannot start AT its floor -- softplus^-1(0) is
+        # -inf and its slope there is 0 -- so it starts this far above it
+        self.floor_margin = 0.1 if tau_min >= 1.0 else 0.0
+        if self.floor_margin:
+            self.set_init_tau(tau_min)
+
+    def set_init_tau(self, tau: float):
+        self.last_bias.data.fill_(inv_softplus(max(tau - self.tau_min, self.floor_margin, 1e-3)))
 
     def summary(self, Atil, E, vis, cbar_i, Rtil, col_size=None, p=None) -> torch.Tensor:
         s = row_summary(Atil, E, vis, cbar_i, Rtil)

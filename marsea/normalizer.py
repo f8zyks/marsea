@@ -293,7 +293,7 @@ class MarSeaNormalizer(nn.Module):
                  block_size: int = 512, head_block: Optional[int] = None, head_block_recompute: bool = True,
                  relation_per_head: int = 0, trigger_tau: bool = False, size_aware_tau_i: bool = False,
                  cap_mode: str = "row", tail_share: float = 0.0, tail_share_learned: bool = False,
-                 tail_share_max: float = 0.5, tail_share_init: float = 0.05):
+                 tail_share_max: float = 0.5, tail_share_init: float = 0.05, tau_i_floor: float = 0.0):
         super().__init__()
         assert quota_mode in ("inherited", "uniform")
         assert gate in ("st", "hard_concrete")
@@ -331,7 +331,12 @@ class MarSeaNormalizer(nn.Module):
         self.tail_share_head = TailShare(d_head, hidden, tail_share_max, tail_share_init, per_head=per_head) if tail_share_learned else None
         self.st_temperature = 1.0               # straight-through backward temperature; the trainer anneals it to 1
         self.tauK = TauK(d_head, hidden, tau_min, zero_field_inputs=key_only_tau, no_nu=no_nu, per_head=per_head)
-        self.tauQ = TauQ(d_head, hidden, tau_min, per_head=per_head, sized=size_aware_tau_i)
+        # tau_i_floor = 1: fan-in step 2 can only SHARPEN.  With tau_i < 1 its quota cbar_i / tau_i exceeds what the relation
+        # holds, the projection is the identity and the final relation is tau_i x Atil_E: the difference leaves the row
+        # (P8 / P9 / P10, 2026-09-21: TauQ learned tau_i 0.63-0.89 at the answer rows; relation mass 0.79 -> 0.51).  With
+        # tau_i >= 1 the final relation mass is its quota cbar_i exactly.  0 = the spec's tau_min (as before).
+        self.tau_i_floor = float(tau_i_floor)
+        self.tauQ = TauQ(d_head, hidden, (self.tau_i_floor if self.tau_i_floor > 0 else tau_min), per_head=per_head, sized=size_aware_tau_i)
         if tau_j_global:
             from .heads import inv_softplus
             self.tau_j_raw = nn.Parameter(torch.tensor(inv_softplus(1.0 - tau_min)))

@@ -44,7 +44,7 @@ def _by_decoding(norm, Q, K_kv, S, vis, n_p, K_ret):
                                       (64, dict(size_aware_tau_i=True)), (3, dict(size_aware_tau_i=True, trigger_tau=True)),
                                       (64, dict(size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2)),
                                       (64, dict(cap_mode="relation")), (3, dict(cap_mode="relation")),
-                                      (64, dict(cap_mode="relation", tail_share=0.3)), (3, dict(cap_mode="relation", tail_share_learned=True)),
+                                      (64, dict(cap_mode="relation", tail_share=0.3)), (64, dict(cap_mode="relation", tail_share=0.3, tau_i_floor=1.0, size_aware_tau_i=True, trigger_tau=True)), (3, dict(cap_mode="relation", tail_share_learned=True)),
                                       (64, dict(cap_mode="relation", tail_share_learned=True, size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2)),
                                       (64, dict(cap_mode="relation", size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2))])
 def test_triggered_equals_prefill_plus_decode(K_ret, kw):
@@ -327,4 +327,27 @@ def test_the_learned_tail_share_is_bounded_starts_small_trains_and_needs_the_rel
     assert all(float(g[n_].grad.abs().sum()) > 0 for n_ in ("tail_share_head.w1", "tail_share_head.w2", "tail_share_head.b2", "relation.U"))
     w, o = norm.new_module_params()
     assert any(p_ is g["tail_share_head.w1"] for p_ in w) and any(p_ is g["tail_share_head.b2"] for p_ in o)
+
+
+def test_a_floored_tau_i_makes_step_2_mass_preserving():
+    """tau_i < 1 is a mass discount on the relation (final = tau_i x Atil_E, the rest leaves the row); floored at 1, step 2
+    only sharpens and the relation ends on its quota exactly."""
+    norm, d, vis = _capped("relation", tail_share=0.3, tau_i_floor=1.0)
+    Ef = d.E.to(DT); has = d.E.any(-1)
+    assert float(d.tau_i.min()) > 1.0 and abs(float(d.tau_i.mean()) - 1.1) < 0.2
+    assert float(((d.A * Ef).sum(-1) - (d.a1 * Ef).sum(-1))[has].abs().max()) < 1e-9
+    norm0, d0, _ = _capped("relation", tail_share=0.3)                                     # the spec's floor (0.05), tau_i pushed below 1
+    with torch.no_grad():
+        norm0.tauQ.set_init_tau(0.6)
+        A0, d0 = norm0.normalize(*_capped_inputs())
+    Ef0 = d0.E.to(DT)
+    assert float(((d0.a1 * Ef0).sum(-1) - (d0.A * Ef0).sum(-1)).max()) > 0.05              # mass that simply vanished
+    from marsea.heads import TauQ
+    q = TauQ(D, tau_min=1.0); q.set_init_tau(1.0)                                          # train.py's phase_b_init call must not kill it
+    assert abs(float(torch.nn.functional.softplus(q.last_bias).mean()) - 0.1) < 1e-6
+
+
+def _capped_inputs():
+    norm, Q, K_kv, S, vis, n_p = _setup(rho=0.4, cap_mode="relation", tail_share=0.3)
+    return S, vis, K_kv, Q, State()
 
