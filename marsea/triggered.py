@@ -69,7 +69,7 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
         if logits_override is not None:
             logits_a = _fp(logits_override[..., n_p:, :] if full_lo else logits_override).expand(B, H, m, n_k)
         else:
-            logits_a = norm.relation(K_kv, Q[:, :, n_p:], key_offset=0, n_k_total=n_k, head_offset=head_offset)
+            logits_a = norm.relation_logits(K_kv, Q[:, :, n_p:], S_a, vis_a, head_offset=head_offset, row_offset=n_p)
         E_a, g_a = norm.select_E(logits_a, vis_a, head_offset, first_row=n_p, n_prefill=n_p)
         # ---- tau_j: sealed at prefill for the prompt keys; an answer key is sealed at its arrival, from its one visible
         # entry S[t, t] and nu_prev = 1 (a one-member column has p = 1), as decode_step does

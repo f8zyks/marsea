@@ -46,7 +46,7 @@ def _by_decoding(norm, Q, K_kv, S, vis, n_p, K_ret):
                                       (64, dict(size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2)),
                                       (64, dict(cap_mode="relation")), (3, dict(cap_mode="relation")),
                                       (64, dict(cap_mode="relation", tail_share=0.3)),
-                                      (64, dict(relation_topk=3)), (3, dict(relation_topk=2, relation_answer_rows_only=True)),
+                                      (64, dict(relation_topk=3)), (64, dict(relation_from_scores=True, relation_topk=3, relation_answer_rows_only=True, direction="column", tau_col=3.0, lam_col=0.2)), (3, dict(relation_topk=2, relation_answer_rows_only=True)),
                                       (64, dict(relation_heads=[1, 4], relation_topk=4, relation_answer_rows_only=True, cap_mode="relation",
                                                 tail_share_learned=True, tail_share_min=0.2, tail_share_init=0.25, tau_i_floor=1.0,
                                                 size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2)), (64, dict(cap_mode="relation", tail_share=0.3, tau_i_floor=1.0, size_aware_tau_i=True, trigger_tau=True)), (3, dict(cap_mode="relation", tail_share_learned=True)), (64, dict(cap_mode="relation", tail_share_learned=True, tail_share_min=0.2, tail_share_init=0.25, tau_i_floor=1.0)),
@@ -510,3 +510,20 @@ def test_auto_direction_switches_per_sequence():
     src = open("marsea/backbone.py").read(); tr = open("marsea/train.py").read()
     assert 'self.normalizer.active_direction = ctx.relation_direction or "row"' in src
     assert 'ctx.relation_direction = "column" if s.source in ("musique", "hotpot") else "row"' in tr
+
+
+def test_relation_from_scores_is_the_rows_top_k_by_attention():
+    norm, Q, K_kv, S, vis, n_p = _setup(rho=0.4, direction="row", tau_row=4.0, lam_row=0.25, relation_topk=3, relation_answer_rows_only=True,
+                                        relation_from_scores=True)
+    with torch.no_grad():
+        A, d = norm.normalize(S, vis, K_kv, Q, State(), n_prefill=n_p)
+        A_p, A_dec = _by_decoding(norm, Q, K_kv, S, vis, n_p, 64)
+    T = S.shape[-1]; visb = vis.expand_as(d.E)
+    Sm = S.masked_fill(~visb, float("-inf")).clone(); Sm[..., 0] = float("-inf")           # the sink column never
+    top = Sm.topk(3, dim=-1).indices
+    want = torch.zeros_like(d.E).scatter(-1, top, True); want[:, :, :n_p] = False
+    assert torch.equal(d.E, want)                                                          # exactly the top-3 by attention, answer rows only
+    assert float((A_dec - A[:, :, n_p:]).abs().max()) < 1e-9
+    src = (A * d.E.to(DT)).amax(-1)[:, :, n_p:]                                           # the winner takes most of R + lam T
+    assert float(src.min()) > 0.2 and float(src.mean()) > 0.5
+

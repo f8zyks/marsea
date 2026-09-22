@@ -296,7 +296,7 @@ class MarSeaNormalizer(nn.Module):
                  tail_share_max: float = 0.5, tail_share_init: float = 0.05, tau_i_floor: float = 0.0,
                  tail_share_min: float = 0.0, relation_heads: Optional[list] = None, relation_topk: int = 0,
                  relation_answer_rows_only: bool = False, direction: Optional[str] = None, tau_row: float = 2.0,
-                 lam_row: float = 0.0, tau_col: float = 2.0, lam_col: float = 0.0):
+                 lam_row: float = 0.0, tau_col: float = 2.0, lam_col: float = 0.0, relation_from_scores: bool = False):
         super().__init__()
         assert quota_mode in ("inherited", "uniform")
         assert gate in ("st", "hard_concrete")
@@ -358,6 +358,11 @@ class MarSeaNormalizer(nn.Module):
         #       far; a generated non-member row of a column with a relation is emitted at (1 - lam_col) A_sm; NO cap after
         #       (the softmax at the start is the unit normalisation; a one-end row may carry > 1).  Column membership grows as rows
         #       are generated, so it runs on the triggered form with tau_col in place of TauKTrigger.
+        # relation_from_scores (a CONTROL, 2026-09-22): the relation logits are the attention scores S themselves -- E is the
+        # row's top-k by attention, nothing learned decides membership.  Separates "the mechanism" from "the learned relation
+        # head": P16a's row form GAINED mass on the rows whose relation held the copy source (0.90 -> 0.93) and lost it on the
+        # rest (0.64 -> 0.48), and the learned head held the source on only 10-30 % of rows.
+        self.relation_from_scores = bool(relation_from_scores)
         assert direction in (None, "row", "column", "auto")
         self.direction = direction
         self.active_direction = direction if direction in ("row", "column") else None
@@ -404,6 +409,16 @@ class MarSeaNormalizer(nn.Module):
         return self._dispatch_one(S, vis, K_kv, Q, state, logits_override=logits_override,
                                   tau_j_override=tau_j_override, tau_i_override=tau_i_override, E_override=E_override,
                                   head_offset=head_offset, **trig)
+
+    def relation_logits(self, K_kv, Q, S, vis, head_offset: int = 0, row_offset: int = 0):
+        """the relation logits for rows [row_offset, row_offset + n_q) -- the learned head, or the attention scores under
+        relation_from_scores (sink pairs masked; no gradient)."""
+        n_q, n_k = S.shape[-2:]
+        if self.relation_from_scores:
+            from .relation import sink_pair_mask, SINK_LOGIT
+            m = sink_pair_mask(n_q, n_k, S.device, 0, n_k)                      # row i sits at global n_k - n_q + i: the sink row only when n_q == n_k
+            return _fp(S).masked_fill(~vis.bool().expand_as(S), SINK_LOGIT).masked_fill(m, SINK_LOGIT).detach()
+        return self.relation(K_kv, Q, key_offset=0, n_k_total=n_k, head_offset=head_offset)
 
     def select_E(self, logits: torch.Tensor, vis: torch.Tensor, head_offset: int = 0, first_row: int = 0, n_prefill: Optional[int] = None):
         """(E, g) from the relation logits: the hard set and its straight-through gate, under the partition options.
@@ -533,6 +548,8 @@ class MarSeaNormalizer(nn.Module):
             # ---- the relation (Sec. 4)
             if logits_override is not None:
                 logits = _fp(logits_override).expand(B, H, n_q, n_k)
+            elif self.relation_from_scores:
+                logits = self.relation_logits(K_kv, Q, S32, vis, head_offset, row_offset=(getattr(self, "_first_row_dense", 0)))
             else:
                 logits = self.relation(K_kv, Q, key_offset=0, n_k_total=n_k, head_offset=head_offset)   # D-31 sink mask inside
             if E_override is not None:

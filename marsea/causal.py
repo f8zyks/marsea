@@ -255,7 +255,7 @@ def decode_step(norm: MarSeaNormalizer, cache: FrozenPrefixCache, S_row: torch.T
         return A_row, info
     S32 = _fp(S_row).masked_fill(~vis, float("-inf"))
     A_sm = row_softmax(S32, vis)                                                 # [B,H,1,n_k]
-    logits = norm.relation(K_kv, q_t, key_offset=0, n_k_total=n_k) if logits_row is None else _fp(logits_row)
+    logits = norm.relation_logits(K_kv, q_t, _fp(S_row), vis, row_offset=t) if logits_row is None else _fp(logits_row)
     E_row, _ = norm.select_E(logits, vis, 0, first_row=t, n_prefill=cache.n_prefill)   # pairwise: no past row changes
     # ---- the new token's own key: seal tau_j now (its visible column is {t}); cbar_j = A_sm[t,t] if E[t,t]
     n_new = n_k - cache.tau_j.shape[-1]
