@@ -451,7 +451,10 @@ def evaluate_ruler(model, tok, ctx: MarSeaContext, examples: list[RULERExample],
                 rec["attention"]["cols_not_measurable"] = sorted(set(dropped))
             rec["e8"] = {l: d.extra.get("e8") for l, d in diags.items()}
         if "generation" in modes and arm.lower() != "b5":
-            text, dt = generate_greedy(model, tok, ctx, ex.prompt_ids, max_new_tokens, device, frozen_prefix=(not dense))
+            # max_new_tokens = None: the LIST's own budget, 9 tokens a value + 16 -- a fixed 160 cut a 32-value answer at 17
+            # values and read as 15 omissions (the B0 gate, 2026-09-22)
+            budget = max_new_tokens if max_new_tokens is not None else 9 * len(ex.outputs) + 16
+            text, dt = generate_greedy(model, tok, ctx, ex.prompt_ids, budget, device, frozen_prefix=(not dense))
             rec["generated"] = text; rec["exact_set"] = exact_set_accuracy(text, ex.outputs)
             rec["ruler_recall"] = ruler_recall_score(text, ex.outputs); rec["decode_seconds"] = dt
             from .blockgold import list_errors
@@ -606,7 +609,7 @@ def quick_eval_factory(examples_ruler: list, examples_qa: list, tok, l_star: int
         # sets only -- no m = 16 example was ever generated, the one length where the arms differ (2026-09-21)
         pick = sorted(set(np.linspace(0, len(examples_ruler) - 1, min(n_gen, len(examples_ruler))).round().astype(int).tolist()))
         gen = evaluate_ruler(model, tok, ctx, [examples_ruler[i] for i in pick], l_star, h_star, arm, modes=("generation",), device=device,
-                             max_new_tokens=160)
+                             max_new_tokens=None)                              # each list's own budget (9 m + 16)
         agg = aggregate_ruler(rows, stratify=None)[None]
         res = dict(tf_loss=float(np.mean([r["tf_loss"] for r in rows])), exact_set_acc=float(np.mean([r["exact_set"] for r in gen])) if gen else None,
                    interval_hit_rate=agg["interval_hit_rate"], row_precision=agg["row_precision"], row_recall=agg["row_recall"],
