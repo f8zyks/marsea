@@ -236,10 +236,22 @@ def decode_step(norm: MarSeaNormalizer, cache: FrozenPrefixCache, S_row: torch.T
     vis = broadcast_vis(vis_row, S_row)
     B, H, _, n_k = S_row.shape
     g_kv = H // K_kv.shape[1]
+    t = cache.n_seen                                                             # index of the new query
+    if getattr(norm, "direction", None) == "row":
+        # the row-constrained one-end form is row-local: the decode step IS the dense normaliser on this one row
+        norm._n_prefill_dense = cache.n_prefill; norm._first_row_dense = t
+        A_row, d = norm._normalize_one(S_row, vis_row, K_kv, q_t, State(), logits_override=logits_row)
+        norm._first_row_dense = 0; norm._n_prefill_dense = None
+        cache.n_seen = t + 1
+        cache.nu = torch.ones(B, H, n_k, dtype=A_row.dtype, device=A_row.device)
+        info = dict(E=d.E, cbar_i=d.cbar_i, tau_i=d.tau_i, theta=d.theta, Rtil=d.Rtil, Atil=d.Atil, a1=d.a1, A_sm=d.A_sm,
+                    supp_rel=d.supp_rel, cap_binds=d.cap_binds, cap_theta=d.cap_theta, excess=torch.zeros_like(d.Rtil), sm_mass=d.A_sm.sum(-1),
+                    kstar_new=(d.p > 0).sum(-1), eviction_events=cache.eviction_events, near_truncation_events=cache.near_truncation_events,
+                    tau_j=torch.ones(B, H, n_k, dtype=A_row.dtype, device=A_row.device), nu=cache.nu)
+        return A_row, info
     S32 = _fp(S_row).masked_fill(~vis, float("-inf"))
     A_sm = row_softmax(S32, vis)                                                 # [B,H,1,n_k]
     logits = norm.relation(K_kv, q_t, key_offset=0, n_k_total=n_k) if logits_row is None else _fp(logits_row)
-    t = cache.n_seen                                                             # index of the new query
     E_row, _ = norm.select_E(logits, vis, 0, first_row=t, n_prefill=cache.n_prefill)   # pairwise: no past row changes
     # ---- the new token's own key: seal tau_j now (its visible column is {t}); cbar_j = A_sm[t,t] if E[t,t]
     n_new = n_k - cache.tau_j.shape[-1]

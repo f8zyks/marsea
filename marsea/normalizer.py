@@ -16,7 +16,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from .primitives import (sorted_prefix_stat, entmax_masked, proj_le_masked, sparsemax_masked_with_stats, TOL_QUOTA, _fp)
+from .primitives import (sorted_prefix_stat, entmax_masked, proj_le_masked, sparsemax_masked_with_stats, sparsemax_masked, TOL_QUOTA, _fp)
 from .relation import RelationHead, straight_through, hard_concrete_gate, repeat_kv
 from .heads import column_stats, row_summary, TauK, TauQ, TAU_MIN
 
@@ -295,7 +295,8 @@ class MarSeaNormalizer(nn.Module):
                  cap_mode: str = "row", tail_share: float = 0.0, tail_share_learned: bool = False,
                  tail_share_max: float = 0.5, tail_share_init: float = 0.05, tau_i_floor: float = 0.0,
                  tail_share_min: float = 0.0, relation_heads: Optional[list] = None, relation_topk: int = 0,
-                 relation_answer_rows_only: bool = False):
+                 relation_answer_rows_only: bool = False, direction: Optional[str] = None, tau_row: float = 2.0,
+                 lam_row: float = 0.0):
         super().__init__()
         assert quota_mode in ("inherited", "uniform")
         assert gate in ("st", "hard_concrete")
@@ -343,6 +344,18 @@ class MarSeaNormalizer(nn.Module):
         self.relation_heads = None if relation_heads is None else sorted(int(h) for h in relation_heads)
         self.relation_topk = int(relation_topk)
         self.relation_answer_rows_only = bool(relation_answer_rows_only)
+        # ---- MarSea v3, the ONE-END forms (owner's decision, 2026-09-22): the relation lives on the MANY-end; each many-end
+        # entry commits its relation attention to ONE one-end entry; the one-end carries no relation and no programme.
+        #   direction = "row"   (NIAH, VT: value tokens are the one-end, answer rows the many-end)  row programme ONLY:
+        #       A_iE = (R_i + lam_row T_i) sparsemax(tau_row S_iE),  the tail scaled by (1 - lam_row),  off E softmax.
+        #       R_i / T_i: the relation's / the tail's softmax mass.  No column quota, no tau_j, no column solve -- a row's
+        #       output depends on its own row alone, so teacher forcing IS decoding (no triggered form needed).
+        #   direction = "column" (QA: answer rows are the one-end, supporting tokens the many-end)  column programme only.
+        #   None: the v2 mechanism (both programmes).  tau_row, lam_row are PRESETS, not learned.
+        assert direction in (None, "row", "column")
+        self.direction = direction
+        self.tau_row = float(tau_row); self.lam_row = float(lam_row)
+        assert 0.0 <= self.lam_row < 1.0 and self.tau_row > 0
         self.tauK = TauK(d_head, hidden, tau_min, zero_field_inputs=key_only_tau, no_nu=no_nu, per_head=per_head)
         # tau_i_floor = 1: fan-in step 2 can only SHARPEN.  With tau_i < 1 its quota cbar_i / tau_i exceeds what the relation
         # holds, the projection is the identity and the final relation is tau_i x Atil_E: the difference leaves the row
@@ -409,8 +422,35 @@ class MarSeaNormalizer(nn.Module):
         E = (lg > 0) & vis
         return E, straight_through(E, lg, vis, self.st_temperature)
 
+    def _row_constrained(self, S32, vis, A_sm, E, g, logits, c, state, out_dtype):
+        """the row-constrained one-end form (see __init__): row-local, exact zeros on the relation, the row keeps one unit."""
+        B, H, n_q, n_k = S32.shape
+        Ef = E.to(S32.dtype)
+        R = (A_sm * Ef).sum(-1); T_ = (A_sm * (1.0 - Ef) * vis.to(S32.dtype)).sum(-1)      # [B,H,n_q]
+        p = sparsemax_masked(self.tau_row * S32.masked_fill(~E, 0.0), E)                  # p_ij = 0 off E_i.; rows sum to 1 (0 if E empty)
+        budget = R + self.lam_row * T_                                                    # the many-end entry's relation mass
+        has = E.any(-1)
+        rel = budget.unsqueeze(-1) * p
+        tail = A_sm * torch.where(has, 1.0 - self.lam_row, 1.0).unsqueeze(-1)              # scaled, never thresholded
+        target = torch.where(E, rel, tail)
+        A = A_sm + g * (target - A_sm)                                                    # ST: forward == target on E and the tail scale
+        A = torch.where(E | ~has.unsqueeze(-1), A, target)                                # off-E scale carries no relation gradient
+        ones = torch.ones(B, H, n_k, dtype=S32.dtype, device=S32.device)
+        if state is not None:
+            state.nu_next = ones                                                          # no column programme: nu = 1 everywhere
+        zq = torch.zeros(B, H, n_q, dtype=S32.dtype, device=S32.device)
+        diag = Diagnostics(E=E, logits=logits, cbar_j=(A_sm * Ef).sum(-2), cbar_i=budget, tau_j=ones, tau_i=torch.full_like(budget, self.tau_row),
+                           psi_j=None, kstar=(p > 0).sum(-2), nu=ones, theta=zq, Rtil=R, supp_rel=((A > 0) & E).sum(-1),
+                           cap_binds=torch.zeros_like(has), cap_theta=zq, p=p, a1=A, Atil=A, A_sm=A_sm, c=c, u=p, A=A)
+        diag.extra["direction"] = "row"
+        return A.to(out_dtype), diag
+
     def _dispatch_one(self, S, vis, K_kv, Q, state=None, *, n_prefill=None, decode_K_ret: int = 64, head_offset: int = 0,
                       logits_override=None, tau_j_override=None, tau_i_override=None, E_override=None):
+        if n_prefill is not None and self.direction == "row":
+            # row-local: the full-sequence form IS the triggered form; prompt rows are known through prompt_rows
+            self._n_prefill_dense = int(n_prefill)
+            return self._normalize_one(S, vis, K_kv, Q, state, logits_override=logits_override, head_offset=head_offset)
         if n_prefill is None:
             return self._normalize_one(S, vis, K_kv, Q, state, logits_override=logits_override, tau_j_override=tau_j_override,
                                        tau_i_override=tau_i_override, E_override=E_override, head_offset=head_offset)
@@ -492,7 +532,9 @@ class MarSeaNormalizer(nn.Module):
             elif self.gate == "hard_concrete" and logits_override is None:
                 g, E = hard_concrete_gate((logits > 0) & vis, logits, vis, self.gate_temperature, self.training)
             else:
-                E, g = self.select_E(logits, vis, head_offset, first_row=0, n_prefill=getattr(self, "_n_prefill_dense", None))
+                E, g = self.select_E(logits, vis, head_offset, first_row=getattr(self, "_first_row_dense", 0), n_prefill=getattr(self, "_n_prefill_dense", None))
+            if self.direction == "row":
+                return self._row_constrained(S32, vis, A_sm, E, g, logits, c, state, out_dtype)
             # ---- STEP 1 fan-out: the inherited quota reads A_sm, NEVER S     (eq:step1)
             cbar_j = (g * A_sm).sum(-2)                                      # [B,H,n_k]   ST site (1)
             if self.quota_mode == "uniform":                                 # E9: put a predicted budget back

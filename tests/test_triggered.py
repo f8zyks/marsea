@@ -389,3 +389,73 @@ def test_partition_relation_options_shape_E_as_specified():
     A.pow(2).sum().backward()
     assert any(p_.grad is not None and float(p_.grad.abs().sum()) > 0 for n_, p_ in norm3.relation.named_parameters() if n_.startswith("U"))
 
+
+
+# --------------------------------------------------------------------------- MarSea v3: the row-constrained one-end form
+@pytest.mark.parametrize("lam,tau,k", [(0.0, 2.0, 4), (0.25, 4.0, 8), (0.5, 1.0, 3)])
+def test_row_constrained_form_mass_rules_and_decode_equality(lam, tau, k):
+    """owner's decision (2026-09-22): the relation lives on the many-end (answer rows); each row commits its relation mass
+    (R_i + lam T_i) to ONE key by sparsemax(tau S); the tail is scaled by 1 - lam; no column programme.  Row-local, so a
+    decode step equals the teacher-forced row exactly."""
+    norm, Q, K_kv, S, vis, n_p = _setup(rho=0.4, direction="row", tau_row=tau, lam_row=lam, relation_topk=k,
+                                        relation_answer_rows_only=True, relation_heads=[0, 2, 5])
+    with torch.no_grad():
+        A, d = norm.normalize(S, vis, K_kv, Q, State(), n_prefill=n_p)
+    T = S.shape[-1]; E = d.E; Ef = E.to(DT); visb = vis.expand_as(E)
+    assert d.extra["direction"] == "row" and bool((E[:, :, :n_p] == False).all()) and bool((E[:, [1, 3, 4]] == False).all())
+    has = E.any(-1)
+    # rows: one unit kept; relation mass = R + lam T; the tail scaled by (1 - lam); exact zeros on the relation
+    R = (d.A_sm * Ef).sum(-1); Tm = (d.A_sm * (1 - Ef) * visb).sum(-1)
+    assert float((A.sum(-1) - 1.0)[visb.any(-1)].abs().max()) < 1e-9
+    assert float(((A * Ef).sum(-1) - (R + lam * Tm))[has].abs().max()) < 1e-9
+    off = visb & ~E
+    assert float((A - d.A_sm * (1 - lam))[off & has.unsqueeze(-1)].abs().max()) < 1e-12
+    assert torch.equal(A[~has], d.A_sm[~has])                                            # a row without a relation is softmax
+    assert bool(((A == 0) & E).any()) or k <= 1                                           # sparsemax zeros inside the relation
+    top = (A * Ef).amax(-1) / (R + lam * Tm).clamp_min(1e-12)
+    assert float(top[has].min()) > 0.5 or tau < 2                                         # commits most of it to one key at tau >= 2
+    # the full-sequence form with prompt_rows and the decode step agree with it row by row
+    with torch.no_grad():
+        A2, _ = norm.normalize(S, vis, K_kv, Q, State(), prompt_rows=n_p)
+        A_p, A_dec = _by_decoding(norm, Q, K_kv, S, vis, n_p, 64)
+    assert float((A2 - A).abs().max()) < 1e-12
+    assert float((A_dec - A[:, :, n_p:]).abs().max()) < 1e-9 and torch.equal(A_p, A[:, :, :n_p, :n_p])
+    # gradients reach the relation
+    norm.zero_grad(); A3, _ = norm.normalize(S, vis, K_kv, Q, State(), n_prefill=n_p); A3.pow(2).sum().backward()
+    assert any(p_.grad is not None and float(p_.grad.abs().sum()) > 0 for n_, p_ in norm.relation.named_parameters() if n_.startswith("U"))
+
+
+def test_row_constrained_whole_model_teacher_forced_equals_cached_decoding():
+    from marsea.evaluate import teacher_forced_pass
+    from marsea.backbone import patch_model, MarSeaContext
+    from marsea.baselines import make_normalizer
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+    torch.manual_seed(0)
+    cfg = Qwen2Config(vocab_size=97, hidden_size=64, intermediate_size=128, num_hidden_layers=3, num_attention_heads=8,
+                      num_key_value_heads=2, max_position_embeddings=512, attn_implementation="eager")
+    model = Qwen2ForCausalLM(cfg).double(); ctx = MarSeaContext(mode="dense")
+    torch.manual_seed(1)
+    patch_model(model, [1, 2], lambda l: make_normalizer("marsea", 8, relation_per_head=8, per_head=8, direction="row", tau_row=3.0, lam_row=0.25,
+                                                         relation_topk=4, relation_answer_rows_only=True).double(), ctx)
+    model.eval(); ctx.triggered = True
+    g = torch.Generator().manual_seed(3); prompt = torch.randint(0, 97, (30,), generator=g).tolist(); gold = torch.randint(0, 97, (6,), generator=g).tolist()
+    ids = torch.tensor([prompt + gold])
+    ctx.n_prefill = len(prompt)
+    with torch.no_grad():
+        full = model(input_ids=ids, use_cache=False).logits[0, len(prompt) - 1:-1]
+    ctx.n_prefill = None
+    # cached decoding: prefill the prompt, then one token at a time
+    from marsea.evaluate import generate_greedy
+    ctx.set_generation = None
+    import marsea.evaluate as ev
+    outs = []
+    with torch.no_grad():
+        ctx.generation = True; ctx.decode_caches = {}
+        pre = model(input_ids=ids[:, :len(prompt)], use_cache=True)
+        past = pre.past_key_values; outs.append(pre.logits[0, -1])
+        for t in range(len(gold) - 1):
+            o = model(input_ids=ids[:, len(prompt) + t: len(prompt) + t + 1], past_key_values=past, use_cache=True)
+            past = o.past_key_values; outs.append(o.logits[0, -1])
+        ctx.generation = False; ctx.decode_caches = {}
+    dec = torch.stack(outs)
+    assert float((dec - full).abs().max()) < 1e-7
