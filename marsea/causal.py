@@ -84,6 +84,7 @@ class FrozenPrefixCache:
     nu: Optional[torch.Tensor] = None              # [B,H,n_k]   last nu (for the next layer's TauK on new keys)
     rel_count: Optional[torch.Tensor] = None       # [B,H,n_k]   the TRUE size of E_.j so far (the lists are truncated at K_ret)
     n_seen: int = 0                                # queries seen so far (prefix length)
+    n_prefill: Optional[int] = None                # rows < n_prefill are prompt rows (relation_answer_rows_only)
     Q_hist: Optional[torch.Tensor] = None          # [B,H,T,d] post-RoPE queries (seal-at-boundary only)
     # Two different events, counted separately (review e982f83 E).  One integer used to add them, so E8's "k* near
     # K_ret" reading and D-28's cache-loss reading could not be told apart -- and fixing the dense/chunked parity
@@ -119,6 +120,7 @@ class FrozenPrefixCache:
         self.rel_qidx[..., :k] = top.indices.masked_fill(~valid, -1)
         self.rel_count = E.sum(-2)
         self.n_seen = n_q
+        self.n_prefill = n_q                                                     # rows < n_prefill are prompt rows (relation_answer_rows_only)
         # a column whose relation exceeds K_ret loses entries to the list: the SAME event _insert_scores counts at
         # decode time, and the one the sparse prefill counts.  Without it the two prefills disagreed on a reported
         # D-28/E8 reading, so truncation_events was incomparable between --mode dense and --mode chunked
@@ -237,8 +239,8 @@ def decode_step(norm: MarSeaNormalizer, cache: FrozenPrefixCache, S_row: torch.T
     S32 = _fp(S_row).masked_fill(~vis, float("-inf"))
     A_sm = row_softmax(S32, vis)                                                 # [B,H,1,n_k]
     logits = norm.relation(K_kv, q_t, key_offset=0, n_k_total=n_k) if logits_row is None else _fp(logits_row)
-    E_row = (logits > 0) & vis                                                   # pairwise: no past row changes
     t = cache.n_seen                                                             # index of the new query
+    E_row, _ = norm.select_E(logits, vis, 0, first_row=t, n_prefill=cache.n_prefill)   # pairwise: no past row changes
     # ---- the new token's own key: seal tau_j now (its visible column is {t}); cbar_j = A_sm[t,t] if E[t,t]
     n_new = n_k - cache.tau_j.shape[-1]
     if n_new > 0:
@@ -332,7 +334,7 @@ def reseal_at_boundary(norm: MarSeaNormalizer, cache: FrozenPrefixCache, K_kv: t
         tau = norm.tauK(k_rep, stats, cache.nu)
     cache.tau_j = tau
     logits = norm.relation(K_kv, Q, key_offset=0, n_k_total=n_k)
-    E = (logits > 0) & vis
+    E, _ = norm.select_E(logits, vis, 0, first_row=0, n_prefill=cache.n_prefill)   # a reseal over the rows so far
     A_sm = row_softmax(S32, vis)
     cache.cbar_j = (A_sm * E.to(A_sm.dtype)).sum(-2)
     K = cache.K_ret

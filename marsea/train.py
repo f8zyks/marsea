@@ -73,6 +73,9 @@ class TrainConfig:
     warmstart_rows: int = 1024                 # query rows sampled per sequence and step
     warmstart_lr: float = 3e-3
     warmstart_sequences: int = 24              # the pool it cycles through, from the cursor on (NOT consumed)
+    warmstart_answer_rows_only: bool = False   # fit the relation on the ANSWER rows only (their high-mass prompt keys are the copy
+                                               # sources); with relation_answer_rows_only the prompt rows have no relation anyway
+    warmstart_min_distance: int = 0            # a target pair must span at least this many tokens (local attention is not retrieval)
     recal_every: int = 0                       # re-bisect b0 (per head when the relation has per-head b0) every N steps
     st_T0: float = 1.0                         # straight-through backward temperature at the start of Phase B ...
     st_anneal_steps: int = 0                   # ... annealed linearly to 1 over this many steps
@@ -151,7 +154,16 @@ def build_model(cfg: TrainConfig, phase_a: bool):
         akw = dict(cfg.arm_kwargs)
         if cfg.head_block and cfg.arm.lower() in ("marsea", "b3"):
             akw.setdefault("head_block", cfg.head_block)
-        ctx = patch_model(model, layers, lambda l: make_normalizer(cfg.arm, d, **akw).to(cfg.device), ctx,
+
+        def _kw_for(l):
+            # relation_heads as {"14": [0, 3, 4, 5], "19": [...]} (arm_kwargs is JSON: string keys): each layer gets its own
+            # list, a layer absent from the map gets NO relation (an empty list), a plain list applies to every layer
+            kw = dict(akw)
+            rh = kw.get("relation_heads")
+            if isinstance(rh, dict):
+                kw["relation_heads"] = [int(h) for h in rh.get(str(l), rh.get(l, []))]
+            return kw
+        ctx = patch_model(model, layers, lambda l: make_normalizer(cfg.arm, d, **_kw_for(l)).to(cfg.device), ctx,
                           checkpoint_patched=(cfg.checkpoint_layers == "patched"))
     ctx.phase_a = phase_a
     for p in model.parameters():
@@ -350,10 +362,13 @@ def _head_candidates(rel, K, Q, vis, n_sub: int):
     return out
 
 
-def _warmstart_targets(S, vis, rows, mass):
+def _warmstart_targets(S, vis, rows, mass, min_distance: int = 0):
     vis_r = broadcast_vis(vis, S)[:, :, rows]
     A = torch.nan_to_num(torch.softmax(S[:, :, rows].float().masked_fill(~vis_r, float("-inf")), -1), nan=0.0)
     cand = vis_r.clone(); cand[..., 0] = False                             # D-31: the sink column is never in a relation
+    if min_distance > 0:                                                    # long-range pairs only: i - j >= min_distance
+        far = (rows.view(-1, 1) - torch.arange(S.shape[-1], device=S.device).view(1, -1)) >= min_distance
+        cand = cand & far.view(1, 1, len(rows), -1)
     return (A >= mass) & cand, cand
 
 
@@ -370,12 +385,13 @@ def relation_warmstart(model, ctx, data, cursor: int, cfg: TrainConfig) -> dict:
     gen = torch.Generator(device="cpu").manual_seed(cfg.seed * 13 + 5)
     was_training = model.training; model.eval(); hist = []
 
-    def step_loss(cap, train: bool):
+    def step_loss(cap, train: bool, n_prompt: int = 0):
         total = 0.0; recall = {}
         for l, nm in norms.items():
             S, vis, K, Q = cap[l]; n_q = S.shape[-2]; H = S.shape[1]
-            rows = torch.randint(1, n_q, (min(cfg.warmstart_rows, n_q - 1),), generator=gen).unique().to(S.device)
-            T, cand = _warmstart_targets(S, vis, rows, cfg.warmstart_mass); cand = cand.expand_as(T)
+            lo = n_prompt if (cfg.warmstart_answer_rows_only and 0 < n_prompt < n_q) else 1
+            rows = torch.randint(lo, n_q, (min(cfg.warmstart_rows, n_q - lo),), generator=gen).unique().to(S.device)
+            T, cand = _warmstart_targets(S, vis, rows, cfg.warmstart_mass, cfg.warmstart_min_distance); cand = cand.expand_as(T)
             lg = nm.relation.raw(K.float(), Q.float()[:, :, rows]) + nm.relation.b0_view(H)
             if train:
                 npos = T.sum((0, 2, 3)).clamp_min(1).float(); nneg = (cand & ~T).sum((0, 2, 3)).clamp_min(1).float()
@@ -393,15 +409,17 @@ def relation_warmstart(model, ctx, data, cursor: int, cfg: TrainConfig) -> dict:
         return total, recall
 
     for k in range(cfg.relation_warmstart_steps):
-        cap = _capture_phase_a(model, ctx, data.get(cursor + k % cfg.warmstart_sequences), cfg.device)
+        seq = data.get(cursor + k % cfg.warmstart_sequences)
+        cap = _capture_phase_a(model, ctx, seq, cfg.device)
         with torch.enable_grad():
-            loss, _ = step_loss(cap, True)
+            loss, _ = step_loss(cap, True, n_prompt_tokens(seq.labels))
             opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
         hist.append(float(loss) / max(1, len(norms)))
         if k % 100 == 0:
             print(f"[phase A 1/2] step {k} relation-fit loss {hist[-1]:.4f}")
     with torch.no_grad():
-        _, recall = step_loss(_capture_phase_a(model, ctx, data.get(cursor + cfg.warmstart_sequences), cfg.device), False)
+        seq = data.get(cursor + cfg.warmstart_sequences)
+        _, recall = step_loss(_capture_phase_a(model, ctx, seq, cfg.device), False, n_prompt_tokens(seq.labels))
     for p, f in zip(params, flags): p.requires_grad_(f)
     opt.zero_grad(set_to_none=True)
     if was_training: model.train()
@@ -416,8 +434,12 @@ def recalibrate_b0(model, ctx, s, cfg: TrainConfig) -> dict:
     """coverage control: b0 back to rho0 on one sequence -- per head where the relation has per-head thresholds.  Nothing
     held coverage after the one calibration of 2026-09 (0.0001 .. 0.40 per layer at the end of that grid)."""
     was_training = model.training; model.eval()
+    norms_ = normalizers(model)
+    if all(getattr(nm, "relation_topk", 0) > 0 for nm in norms_.values() if hasattr(nm, "relation")):
+        if was_training: model.train()
+        return {}                                                                 # top-k: b0 is a shift E does not see
     cap = _capture_phase_a(model, ctx, s, cfg.device); out = {}
-    for l, nm in normalizers(model).items():
+    for l, nm in norms_.items():
         if not isinstance(nm, MarSeaNormalizer) or l not in cap: continue
         S, vis, K, Q = cap[l]
         heads = _head_candidates(nm.relation, K, Q, vis, max(1, cfg.calib_subsample // max(1, S.shape[1])))

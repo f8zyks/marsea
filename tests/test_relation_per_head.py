@@ -137,3 +137,28 @@ def test_per_head_tau_heads_with_the_per_head_relation_and_their_per_head_calibr
         O_d, A_d, dd = _dense(norm, Q, K_kv, V_kv, vis, State())
         O_c, dc = marsea_chunked_attention(norm, Q, K_kv, V_kv, vis, State(), chunk=32, dense_outputs=True)
     assert (dc.E == dd.E).all() and float((O_c - O_d).abs().max()) < 1e-9
+
+
+def test_warmstart_targets_can_be_long_range_only():
+    """2026-09-22: a warm-start target pair may be required to span >= min_distance tokens (local attention is not retrieval)."""
+    import torch
+    from marsea.train import _warmstart_targets
+    torch.manual_seed(0)
+    n = 40; S = torch.randn(1, 2, n, n); vis = torch.tril(torch.ones(n, n, dtype=torch.bool)).view(1, 1, n, n)
+    rows = torch.tensor([10, 30, 39])
+    T0, c0 = _warmstart_targets(S, vis, rows, 0.0)
+    T1, c1 = _warmstart_targets(S, vis, rows, 0.0, min_distance=8)
+    assert bool(c0[0, 0, 0, 1:11].all()) and not bool(c0[..., 0].any())              # every visible non-sink pair; the sink column never
+    assert bool(c1[0, 0, 0, 1:3].all()) and not bool(c1[0, 0, 0, 3:].any())          # row 10: keys <= 2 only
+    assert int(c1[0, 0, 2].sum()) == 39 - 8 and bool((T1 <= c1).all())
+
+
+def test_relation_heads_map_is_resolved_per_layer():
+    """arm_kwargs {"relation_heads": {"14": [0, 3], "19": [1]}}: layer 14 gets [0, 3], layer 19 [1], an absent layer NONE."""
+    from marsea.normalizer import MarSeaNormalizer
+    n = MarSeaNormalizer(16, 4, relation_heads=[0, 3])
+    assert n.relation_heads == [0, 3]
+    n2 = MarSeaNormalizer(16, 4, relation_heads=[])
+    assert n2.relation_heads == []                                                     # no head carries a relation: softmax
+    src = open("marsea/train.py").read()
+    assert 'rh.get(str(l), rh.get(l, []))' in src

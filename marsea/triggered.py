@@ -57,8 +57,10 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
     nu_prev = state.nu_prev if (state is not None and state.nu_prev is not None) else None
     st_p = State(nu_prev=None if nu_prev is None else nu_prev[..., :n_p])
     full_lo = logits_override is not None and tuple(logits_override.shape[-2:]) == (n_k, n_k)    # a whole [n, n] override: sliced
+    norm._n_prefill_dense = n_p                                          # the prompt block: rows < n_p are prompt rows
     A_p, d_p = norm._normalize_one(S[:, :, :n_p, :n_p], visb[:, :, :n_p, :n_p], K_kv[:, :, :n_p], Q[:, :, :n_p], st_p,
                                    logits_override=(logits_override[..., :n_p, :n_p] if full_lo else logits_override), head_offset=head_offset)
+    norm._n_prefill_dense = None
     with torch.autocast(device_type=S.device.type, enabled=False):
         S32 = _fp(S).masked_fill(~visb, float("-inf"))
         dt, dev = S32.dtype, S.device
@@ -68,8 +70,7 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
             logits_a = _fp(logits_override[..., n_p:, :] if full_lo else logits_override).expand(B, H, m, n_k)
         else:
             logits_a = norm.relation(K_kv, Q[:, :, n_p:], key_offset=0, n_k_total=n_k, head_offset=head_offset)
-        E_a = (logits_a > 0) & vis_a
-        g_a = straight_through(E_a, logits_a, vis_a, norm.st_temperature)
+        E_a, g_a = norm.select_E(logits_a, vis_a, head_offset, first_row=n_p, n_prefill=n_p)
         # ---- tau_j: sealed at prefill for the prompt keys; an answer key is sealed at its arrival, from its one visible
         # entry S[t, t] and nu_prev = 1 (a one-member column has p = 1), as decode_step does
         diag_s = torch.diagonal(S32[:, :, n_p:, n_p:], dim1=-2, dim2=-1)           # [B,H,m]

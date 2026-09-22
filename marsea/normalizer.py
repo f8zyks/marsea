@@ -294,7 +294,8 @@ class MarSeaNormalizer(nn.Module):
                  relation_per_head: int = 0, trigger_tau: bool = False, size_aware_tau_i: bool = False,
                  cap_mode: str = "row", tail_share: float = 0.0, tail_share_learned: bool = False,
                  tail_share_max: float = 0.5, tail_share_init: float = 0.05, tau_i_floor: float = 0.0,
-                 tail_share_min: float = 0.0):
+                 tail_share_min: float = 0.0, relation_heads: Optional[list] = None, relation_topk: int = 0,
+                 relation_answer_rows_only: bool = False):
         super().__init__()
         assert quota_mode in ("inherited", "uniform")
         assert gate in ("st", "hard_concrete")
@@ -331,6 +332,17 @@ class MarSeaNormalizer(nn.Module):
         from .heads import TailShare
         self.tail_share_head = TailShare(d_head, hidden, tail_share_max, tail_share_init, per_head=per_head, lam_min=tail_share_min) if tail_share_learned else None
         self.st_temperature = 1.0               # straight-through backward temperature; the trainer anneals it to 1
+        # ---- the PARTITION relation (owner's decision, 2026-09-22; P14 showed the 5 %-coverage relation is 98 % off-block):
+        #   relation_heads         the Q-heads (global indices) that carry a relation at all; the others are plain softmax.
+        #                          None: every head.  The retrieval heads come from the block metrics of the softmax model.
+        #   relation_topk = k      E_i. = the k highest logits of row i among the candidates (a per-row budget) instead of
+        #                          logits > 0; the straight-through gate is centred at the row's k-th logit.  b0 is then
+        #                          irrelevant to E (a shift), and coverage is k / n_vis by construction.
+        #   relation_answer_rows_only  prompt rows carry no relation: only GENERATED rows are members of any column, so a
+        #                          column's competitors are the answer rows -- "an earlier answer row claimed this key".
+        self.relation_heads = None if relation_heads is None else sorted(int(h) for h in relation_heads)
+        self.relation_topk = int(relation_topk)
+        self.relation_answer_rows_only = bool(relation_answer_rows_only)
         self.tauK = TauK(d_head, hidden, tau_min, zero_field_inputs=key_only_tau, no_nu=no_nu, per_head=per_head)
         # tau_i_floor = 1: fan-in step 2 can only SHARPEN.  With tau_i < 1 its quota cbar_i / tau_i exceeds what the relation
         # holds, the projection is the identity and the final relation is tau_i x Atil_E: the difference leaves the row
@@ -346,7 +358,7 @@ class MarSeaNormalizer(nn.Module):
     def normalize(self, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Tensor, Q: torch.Tensor,
                   state: Optional[State] = None, *, logits_override: Optional[torch.Tensor] = None,
                   tau_j_override=None, tau_i_override=None, E_override: Optional[torch.Tensor] = None,
-                  head_offset: int = 0, n_prefill: Optional[int] = None, decode_K_ret: int = 64):
+                  head_offset: int = 0, n_prefill: Optional[int] = None, decode_K_ret: int = 64, prompt_rows: Optional[int] = None):
         """n_prefill: the TRIGGERED teacher-forced form (marsea/triggered.py) -- rows < n_prefill are the prompt and
         are normalised as the generation prefill is; every later row re-solves the columns its own relation triggers
         over the members that exist by then, as decode_step does.  None: the full-sequence form.
@@ -356,6 +368,10 @@ class MarSeaNormalizer(nn.Module):
         never"), so this is the head-axis analogue of the key chunking of Sec. 6.6 -- arithmetically identical, and it
         divides the [B, H, n_q, n_k] transients that dominate memory by H / head_block."""
         trig = {}
+        # prompt_rows: how many leading rows are PROMPT rows, for relation_answer_rows_only on the full-sequence form (a
+        # teacher-forced pass, or the generation prefill where every row is one); the triggered form knows from n_prefill
+        self._n_prefill_dense = (int(prompt_rows) if prompt_rows is not None else
+                                 int(n_prefill) if n_prefill is not None else None)
         if n_prefill is not None and 0 < int(n_prefill) < S.shape[-2] and S.shape[-2] == S.shape[-1]:
             assert tau_j_override is None and tau_i_override is None and E_override is None, "overrides: full-sequence form only"
             trig = dict(n_prefill=int(n_prefill), decode_K_ret=int(decode_K_ret))
@@ -366,6 +382,32 @@ class MarSeaNormalizer(nn.Module):
         return self._dispatch_one(S, vis, K_kv, Q, state, logits_override=logits_override,
                                   tau_j_override=tau_j_override, tau_i_override=tau_i_override, E_override=E_override,
                                   head_offset=head_offset, **trig)
+
+    def select_E(self, logits: torch.Tensor, vis: torch.Tensor, head_offset: int = 0, first_row: int = 0, n_prefill: Optional[int] = None):
+        """(E, g) from the relation logits: the hard set and its straight-through gate, under the partition options.
+        first_row: the global index of logits' first row (the dense form: 0; the triggered answer block: n_p; decode: t).
+        One function for the dense form, the triggered form and decode_step, so the three cannot disagree on E."""
+        H = logits.shape[1]; n_q, n_k = logits.shape[-2:]
+        lg = logits
+        if self.relation_heads is not None:                                          # heads without a relation: E empty, no gradient
+            keep = torch.zeros(H, dtype=torch.bool, device=logits.device)
+            for h in self.relation_heads:
+                if head_offset <= h < head_offset + H: keep[h - head_offset] = True
+            lg = lg.masked_fill(~keep.view(1, H, 1, 1), -1e4)
+        if self.relation_answer_rows_only and n_prefill is not None and first_row < n_prefill:   # prompt rows: no relation
+            rows = torch.arange(first_row, first_row + n_q, device=logits.device) < n_prefill
+            lg = lg.masked_fill(rows.view(1, 1, n_q, 1), -1e4)
+        if self.relation_topk > 0:
+            k = min(self.relation_topk, n_k)
+            cand = lg.masked_fill(~vis, float("-inf"))
+            kth = cand.topk(k, dim=-1).values[..., -1:]                                # the row's k-th logit
+            # a row with fewer than k visible pairs has -inf there: every visible pair qualifies (threshold below them all)
+            kth = torch.where(torch.isfinite(kth), kth, torch.full_like(kth, -1e4 + 0.5))
+            E = (cand >= kth) & vis & (lg > -1e4 + 1.0)                                # ties: all admitted; masked heads / rows never
+            g = straight_through(E, lg - kth.detach(), vis, self.st_temperature)
+            return E, g
+        E = (lg > 0) & vis
+        return E, straight_through(E, lg, vis, self.st_temperature)
 
     def _dispatch_one(self, S, vis, K_kv, Q, state=None, *, n_prefill=None, decode_K_ret: int = 64, head_offset: int = 0,
                       logits_override=None, tau_j_override=None, tau_i_override=None, E_override=None):
@@ -450,8 +492,7 @@ class MarSeaNormalizer(nn.Module):
             elif self.gate == "hard_concrete" and logits_override is None:
                 g, E = hard_concrete_gate((logits > 0) & vis, logits, vis, self.gate_temperature, self.training)
             else:
-                E = (logits > 0) & vis
-                g = straight_through(E, logits, vis, self.st_temperature)
+                E, g = self.select_E(logits, vis, head_offset, first_row=0, n_prefill=getattr(self, "_n_prefill_dense", None))
             # ---- STEP 1 fan-out: the inherited quota reads A_sm, NEVER S     (eq:step1)
             cbar_j = (g * A_sm).sum(-2)                                      # [B,H,n_k]   ST site (1)
             if self.quota_mode == "uniform":                                 # E9: put a predicted budget back

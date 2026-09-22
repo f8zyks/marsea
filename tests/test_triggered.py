@@ -30,7 +30,8 @@ def _by_decoding(norm, Q, K_kv, S, vis, n_p, K_ret):
     """the reference: prefill the prompt, then one decode_step per answer row."""
     T = S.shape[-1]; rows = []
     with torch.no_grad():
-        A_p, d_p = norm.normalize(S[:, :, :n_p, :n_p], vis[:, :, :n_p, :n_p], K_kv[:, :, :n_p], Q[:, :, :n_p], State())
+        A_p, d_p = norm.normalize(S[:, :, :n_p, :n_p], vis[:, :, :n_p, :n_p], K_kv[:, :, :n_p], Q[:, :, :n_p], State(),
+                                  prompt_rows=(n_p if norm.relation_answer_rows_only else None))   # the prefill: every row is a prompt row
         cache = FrozenPrefixCache(K_ret=K_ret); cache.init_from_prefill(S[:, :, :n_p, :n_p].masked_fill(~vis[:, :, :n_p, :n_p], float("-inf")), d_p)
         for t in range(n_p, T):
             A_row, info = decode_step(norm, cache, S[:, :, t:t + 1, :t + 1], vis[:, :, t:t + 1, :t + 1], K_kv[:, :, :t + 1], Q[:, :, t:t + 1])
@@ -44,7 +45,11 @@ def _by_decoding(norm, Q, K_kv, S, vis, n_p, K_ret):
                                       (64, dict(size_aware_tau_i=True)), (3, dict(size_aware_tau_i=True, trigger_tau=True)),
                                       (64, dict(size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2)),
                                       (64, dict(cap_mode="relation")), (3, dict(cap_mode="relation")),
-                                      (64, dict(cap_mode="relation", tail_share=0.3)), (64, dict(cap_mode="relation", tail_share=0.3, tau_i_floor=1.0, size_aware_tau_i=True, trigger_tau=True)), (3, dict(cap_mode="relation", tail_share_learned=True)), (64, dict(cap_mode="relation", tail_share_learned=True, tail_share_min=0.2, tail_share_init=0.25, tau_i_floor=1.0)),
+                                      (64, dict(cap_mode="relation", tail_share=0.3)),
+                                      (64, dict(relation_topk=3)), (3, dict(relation_topk=2, relation_answer_rows_only=True)),
+                                      (64, dict(relation_heads=[1, 4], relation_topk=4, relation_answer_rows_only=True, cap_mode="relation",
+                                                tail_share_learned=True, tail_share_min=0.2, tail_share_init=0.25, tau_i_floor=1.0,
+                                                size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2)), (64, dict(cap_mode="relation", tail_share=0.3, tau_i_floor=1.0, size_aware_tau_i=True, trigger_tau=True)), (3, dict(cap_mode="relation", tail_share_learned=True)), (64, dict(cap_mode="relation", tail_share_learned=True, tail_share_min=0.2, tail_share_init=0.25, tau_i_floor=1.0)),
                                       (64, dict(cap_mode="relation", tail_share_learned=True, size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2)),
                                       (64, dict(cap_mode="relation", size_aware_tau_i=True, trigger_tau=True, relation_per_head=6, per_head=6, head_block=2))])
 def test_triggered_equals_prefill_plus_decode(K_ret, kw):
@@ -353,4 +358,34 @@ def test_a_floored_tau_i_makes_step_2_mass_preserving():
 def _capped_inputs():
     norm, Q, K_kv, S, vis, n_p = _setup(rho=0.4, cap_mode="relation", tail_share=0.3)
     return S, vis, K_kv, Q, State()
+
+
+def test_partition_relation_options_shape_E_as_specified():
+    """owner's decision (2026-09-22): a per-row budget, no relation on non-retrieval heads, prompt rows without a relation."""
+    norm, Q, K_kv, S, vis, n_p = _setup(rho=0.4, relation_heads=[0, 2, 5], relation_topk=3, relation_answer_rows_only=True)
+    with torch.no_grad():
+        A, d = norm.normalize(S, vis, K_kv, Q, State(), n_prefill=n_p)
+    T = S.shape[-1]; E = d.E[0]
+    assert bool((E[[1, 3, 4]] == False).all())                                       # heads without a relation
+    assert bool((E[:, :n_p] == False).all())                                          # prompt rows carry none
+    sizes = E[[0, 2, 5], n_p:].sum(-1)
+    assert bool((sizes == 3).all()), sizes                                             # exactly k per answer row on the relation heads
+    assert torch.equal(A[0, [1, 3, 4]], d.A_sm[0, [1, 3, 4]])                         # a head without a relation IS softmax
+    # the full-sequence form with prompt_rows agrees on E
+    with torch.no_grad():
+        A2, d2 = norm.normalize(S, vis, K_kv, Q, State(), prompt_rows=n_p)
+    assert torch.equal(d2.E, d.E)
+    # top-k alone: every visible row of every head has k members (or all of a shorter row)
+    norm2, Q, K_kv, S, vis, n_p = _setup(rho=0.4, relation_topk=5)
+    with torch.no_grad():
+        _, d3 = norm2.normalize(S, vis, K_kv, Q, State())
+    n_vis = vis.expand_as(d3.E).sum(-1)
+    from marsea.relation import sink_pair_mask
+    cand = (vis.expand_as(d3.E) & ~sink_pair_mask(S.shape[-2], S.shape[-1], S.device)).sum(-1)
+    assert bool((d3.E.sum(-1) == torch.minimum(cand, torch.full_like(cand, 5))).all())
+    # gradients still reach the relation through the top-k gate
+    norm3, Q, K_kv, S, vis, n_p = _setup(rho=0.4, relation_topk=4, relation_answer_rows_only=True)
+    A, d = norm3.normalize(S, vis, K_kv, Q, State(), n_prefill=n_p)
+    A.pow(2).sum().backward()
+    assert any(p_.grad is not None and float(p_.grad.abs().sum()) > 0 for n_, p_ in norm3.relation.named_parameters() if n_.startswith("U"))
 

@@ -356,6 +356,13 @@ class MarSeaAttention(nn.Module):
                     self.normalizer.want_E = bool(ctx.collect or self.normalizer.want_dense_diag or ctx.generation)
                 if trig:                                                          # prompt rows as the prefill, answer rows as decode steps
                     kw["n_prefill"] = int(ctx.n_prefill); kw["decode_K_ret"] = int(ctx.K_ret)
+                elif getattr(self.normalizer, "relation_answer_rows_only", False) and n_q == n_k:
+                    # the full-sequence form under relation_answer_rows_only: which leading rows are the prompt -- the
+                    # generation prefill is all prompt; a teacher-forced pass says through ctx.n_prefill
+                    if ctx.generation:
+                        kw["prompt_rows"] = n_q
+                    elif ctx.n_prefill:
+                        kw["prompt_rows"] = int(ctx.n_prefill)
                 A, diag = self.normalizer.normalize(S, vis, k, q, state, **kw)
                 ctx.nu[self.layer_idx] = state.nu_next
                 if ctx.generation:                                                # prefill: seed the decode cache
