@@ -23,6 +23,7 @@ from . import SPEC_VERSION
 from .backbone import load_backbone, patch_model, normalizers, MarSeaContext, _base_model
 from .baselines import make_normalizer
 from .normalizer import MarSeaNormalizer, broadcast_vis
+from .relation import repeat_kv
 from .heads import inv_softplus
 
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj"]
@@ -76,6 +77,13 @@ class TrainConfig:
     warmstart_answer_rows_only: bool = False   # fit the relation on the ANSWER rows only (their high-mass prompt keys are the copy
                                                # sources); with relation_answer_rows_only the prompt rows have no relation anyway
     warmstart_min_distance: int = 0            # a target pair must span at least this many tokens (local attention is not retrieval)
+    warmstart_targets: str = "attention"       # "attention": the Phase-A model's high-mass pairs; "blocks": the BLOCK GOLD -- each answer
+                                               # row's own block (its value's needle / the supporting spans) positive, the other blocks'
+                                               # spans hard negatives (owner's decision, 2026-09-23; needs data built with_tags)
+    aux_block_weight: float = 0.0              # Phase B: an auxiliary class-balanced BCE of the relation logits against the block gold at
+                                               # the answer rows of the relation heads, weight annealed to 0 over aux_anneal_steps
+    aux_anneal_steps: int = 1000
+    aux_hard_negative_weight: float = 4.0      # the other blocks' spans (stale / remaining values, distractor passages) weigh this much
     recal_every: int = 0                       # re-bisect b0 (per head when the relation has per-head b0) every N steps
     st_T0: float = 1.0                         # straight-through backward temperature at the start of Phase B ...
     st_anneal_steps: int = 0                   # ... annealed linearly to 1 over this many steps
@@ -372,6 +380,67 @@ def _warmstart_targets(S, vis, rows, mass, min_distance: int = 0):
     return (A >= mass) & cand, cand
 
 
+def block_targets(blocks: list, rows, n_k: int, device):
+    """the BLOCK GOLD as relation targets for the given rows: (T [R, n_k] positives = the row's own block spans,
+    W [R, n_k] weights = hard-negative weight on the other blocks' spans, 1 elsewhere; owned [R] = the row belongs to a block).
+    Rows not owned by any block get no positives and are excluded by the caller."""
+    R = len(rows); T = torch.zeros(R, n_k, dtype=torch.bool, device=device); W = torch.ones(R, n_k, device=device)
+    owned = torch.zeros(R, dtype=torch.bool, device=device)
+    own_of = {}
+    for i, b in enumerate(blocks or []):
+        for r in b["rows"]: own_of[int(r)] = i
+    all_spans = torch.zeros(n_k, dtype=torch.bool, device=device)
+    for b in blocks or []:
+        for a, e in b["spans"]: all_spans[max(0, a):min(n_k, e)] = True
+    for k, r in enumerate([int(x) for x in rows]):
+        if r not in own_of: continue
+        owned[k] = True
+        own = torch.zeros(n_k, dtype=torch.bool, device=device)
+        for a, e in blocks[own_of[r]]["spans"]: own[max(0, a):min(n_k, e)] = True
+        T[k] = own; W[k] = torch.where(all_spans & ~own, torch.full_like(W[k], 1.0), W[k])
+    return T, W, owned
+
+
+def block_bce(lg, T, cand, w_hard, hard_mask):
+    """class-balanced BCE per head over the candidate pairs; hard negatives weighted w_hard.  lg / T / cand / hard [H, R, n_k]."""
+    H = lg.shape[0]
+    npos = T.sum((1, 2)).clamp_min(1).float(); nneg = (cand & ~T).sum((1, 2)).clamp_min(1).float()
+    w = torch.where(T, (nneg / npos).clamp(max=2000.0).view(H, 1, 1), torch.where(hard_mask, torch.full_like(lg, w_hard), torch.ones_like(lg)))
+    bce = F.binary_cross_entropy_with_logits(lg, T.float(), weight=w, reduction="none") * cand
+    return (bce.sum((1, 2)) / (w * cand).sum((1, 2)).clamp_min(1)).mean()
+
+
+def aux_block_loss(model, ctx, seq, cfg: TrainConfig, step: int):
+    """the Phase-B auxiliary: relation logits at the sequence's owned answer rows against the block gold, on the relation heads,
+    from the (K, Q) the backbone captured during the LM forward (detached: the targets shape the RELATION, not the LoRA)."""
+    w0 = cfg.aux_block_weight * max(0.0, 1.0 - (step - cfg.phase_a_steps) / max(1, cfg.aux_anneal_steps))
+    if w0 <= 0 or not seq.blocks or not getattr(ctx, "aux_qk", None):
+        return None, 0.0
+    total = 0.0; n = 0
+    for l, nm in normalizers(model).items():
+        if not isinstance(nm, MarSeaNormalizer) or l not in ctx.aux_qk: continue
+        K, Q, scaling = ctx.aux_qk[l]
+        n_k = K.shape[-2]
+        rows_all = sorted({int(r) for b in seq.blocks for r in b["rows"] if int(r) < n_k})
+        if not rows_all: continue
+        rows = torch.tensor(rows_all, device=K.device)
+        T, W, owned = block_targets(seq.blocks, rows_all, n_k, K.device)
+        Qr = Q[:, :, rows].float(); Kf = K.float()
+        g = Q.shape[1] // K.shape[1]
+        S_r = torch.einsum("bhid,bhjd->bhij", Qr, repeat_kv(Kf, g)) * scaling
+        vis = (torch.arange(n_k, device=K.device).view(1, -1) <= rows.view(-1, 1)).view(1, 1, len(rows_all), n_k)
+        lg = nm.relation_logits(Kf, Qr, S_r, vis)[0]                                   # [H, R, n_k]
+        heads = nm.relation_heads if nm.relation_heads is not None else list(range(lg.shape[0]))
+        if not heads: continue
+        cand = vis[0].expand(len(heads), -1, -1).clone(); cand[..., 0] = False
+        hard = (W > 1.0).unsqueeze(0).expand(len(heads), -1, -1)
+        lgh = lg[heads]; Th = T.unsqueeze(0).expand(len(heads), -1, -1)
+        total = total + block_bce(lgh, Th, cand, cfg.aux_hard_negative_weight, hard); n += 1
+    if n == 0:
+        return None, w0
+    return w0 * total / n, w0
+
+
 def relation_warmstart(model, ctx, data, cursor: int, cfg: TrainConfig) -> dict:
     """Phase A 1/2.  Everything frozen but the relation heads, which are fitted -- class-balanced BCE per head -- to the
     Phase-A model's own high-attention pairs.  Phase B then starts from a relation that CONTAINS the pairs the heads use
@@ -385,17 +454,30 @@ def relation_warmstart(model, ctx, data, cursor: int, cfg: TrainConfig) -> dict:
     gen = torch.Generator(device="cpu").manual_seed(cfg.seed * 13 + 5)
     was_training = model.training; model.eval(); hist = []
 
-    def step_loss(cap, train: bool, n_prompt: int = 0):
+    def step_loss(cap, train: bool, n_prompt: int = 0, blocks=None):
         total = 0.0; recall = {}
         for l, nm in norms.items():
             S, vis, K, Q = cap[l]; n_q = S.shape[-2]; H = S.shape[1]
-            lo = n_prompt if (cfg.warmstart_answer_rows_only and 0 < n_prompt < n_q) else 1
-            rows = torch.randint(lo, n_q, (min(cfg.warmstart_rows, n_q - lo),), generator=gen).unique().to(S.device)
-            T, cand = _warmstart_targets(S, vis, rows, cfg.warmstart_mass, cfg.warmstart_min_distance); cand = cand.expand_as(T)
-            lg = nm.relation.raw(K.float(), Q.float()[:, :, rows]) + nm.relation.b0_view(H)
+            if cfg.warmstart_targets == "blocks":
+                assert blocks is not None, "warmstart_targets = blocks needs data built with_tags"
+                rows_all = sorted({int(r) for b in blocks for r in b["rows"] if int(r) < n_q})
+                if not rows_all: continue
+                rows = torch.tensor(rows_all, device=S.device)
+                Tb, Wb, _ = block_targets(blocks, rows_all, S.shape[-1], S.device)
+                vis_r = broadcast_vis(vis, S)[:, :, rows]
+                cand = vis_r.clone(); cand[..., 0] = False; cand = cand.expand(1, H, len(rows_all), -1)
+                T = Tb.view(1, 1, len(rows_all), -1).expand_as(cand) & cand
+                hard = (Wb > 1.0).view(1, 1, len(rows_all), -1).expand_as(cand)
+            else:
+                lo = n_prompt if (cfg.warmstart_answer_rows_only and 0 < n_prompt < n_q) else 1
+                rows = torch.randint(lo, n_q, (min(cfg.warmstart_rows, n_q - lo),), generator=gen).unique().to(S.device)
+                T, cand = _warmstart_targets(S, vis, rows, cfg.warmstart_mass, cfg.warmstart_min_distance); cand = cand.expand_as(T)
+                hard = torch.zeros_like(cand)
+            lg = nm.relation_logits(K.float(), Q.float()[:, :, rows], S[:, :, rows].float(), broadcast_vis(vis, S)[:, :, rows], row_offset=int(rows.min()))
             if train:
                 npos = T.sum((0, 2, 3)).clamp_min(1).float(); nneg = (cand & ~T).sum((0, 2, 3)).clamp_min(1).float()
-                w = torch.where(T, (nneg / npos).clamp(max=2000.0).view(1, H, 1, 1), torch.ones((), device=S.device))
+                w = torch.where(T, (nneg / npos).clamp(max=2000.0).view(1, H, 1, 1),
+                                torch.where(hard, torch.full_like(lg, cfg.aux_hard_negative_weight), torch.ones_like(lg)))
                 bce = F.binary_cross_entropy_with_logits(lg, T.float(), weight=w, reduction="none") * cand
                 total = total + (bce.sum((0, 2, 3)) / (w * cand).sum((0, 2, 3)).clamp_min(1)).mean()
             else:                                                          # recall of the targets when each head admits rho0
@@ -412,14 +494,14 @@ def relation_warmstart(model, ctx, data, cursor: int, cfg: TrainConfig) -> dict:
         seq = data.get(cursor + k % cfg.warmstart_sequences)
         cap = _capture_phase_a(model, ctx, seq, cfg.device)
         with torch.enable_grad():
-            loss, _ = step_loss(cap, True, n_prompt_tokens(seq.labels))
+            loss, _ = step_loss(cap, True, n_prompt_tokens(seq.labels), seq.blocks)
             opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
         hist.append(float(loss) / max(1, len(norms)))
         if k % 100 == 0:
             print(f"[phase A 1/2] step {k} relation-fit loss {hist[-1]:.4f}")
     with torch.no_grad():
         seq = data.get(cursor + cfg.warmstart_sequences)
-        _, recall = step_loss(_capture_phase_a(model, ctx, seq, cfg.device), False, n_prompt_tokens(seq.labels))
+        _, recall = step_loss(_capture_phase_a(model, ctx, seq, cfg.device), False, n_prompt_tokens(seq.labels), seq.blocks)
     for p, f in zip(params, flags): p.requires_grad_(f)
     opt.zero_grad(set_to_none=True)
     if was_training: model.train()
@@ -826,7 +908,7 @@ def train(cfg: TrainConfig, data, quick_eval=None, monitor=None):
             b0s = {l: bias_record(nm.relation.b0) for l, nm in normalizers(model).items() if hasattr(nm, "relation")}
             log(dict(step=step, loss=loss, e8=e8, head_lr_scale=head_lr_scale, grad_norms=ctx.extra_log.get("grad_norms"),
                      nonfinite_grads=ctx.extra_log.get("nonfinite_grads"), b0=b0s, b0_recalibrated=recal is not None,
-                     st_temperature=st_temperature(step, cfg)))
+                     st_temperature=st_temperature(step, cfg), aux_block=ctx.extra_log.get("aux_block"), aux_w=ctx.extra_log.get("aux_w")))
             miss = [l for l, v in e8.items() if "missing" in v]
             print(f"[B] step {step} loss {loss:.4f} "
                   + (f"rho {[round(v['rho'], 4) for v in e8.values() if 'rho' in v]}" if e8 else "")
@@ -875,6 +957,7 @@ def train_step(model, ctx, opt, data, cursor, step, cfg, log, head_lr_scale=1.0)
     for micro, s in enumerate(seqs):
         ids = s.input_ids.to(dev); labels = s.labels.to(dev)
         keep = torch.nonzero(labels[0, 1:] != -100).flatten()                   # positions that PREDICT a labelled token
+        ctx.aux_capture = bool(cfg.aux_block_weight > 0 and s.blocks); ctx.aux_qk = {}
         ctx.n_prefill = n_prompt_tokens(labels)                                 # read by the triggered form only; it stays set
         ctx.relation_direction = "column" if s.source in ("musique", "hotpot") else "row"   # v3 "auto": the task's one-end direction
                                                                                 # through backward (checkpointed layers recompute)
@@ -888,8 +971,12 @@ def train_step(model, ctx, opt, data, cursor, step, cfg, log, head_lr_scale=1.0)
         # (and in any checkpointed recompute) under the ambient autocast state, which would run the programs' gradients
         # in bf16 -- measured at ~3e-2 relative against ~5e-7 for the correct ordering (review 2026-09-12 follow-up)
         assert not torch.is_autocast_enabled(), "backward under autocast: the programs' gradients would run in bf16"
-        (loss_tok / tokens_in_window).backward()
+        aux, aux_w = aux_block_loss(model, ctx, s, cfg, step) if cfg.aux_block_weight > 0 else (None, 0.0)
+        ((loss_tok / tokens_in_window) + (aux / cfg.accum if aux is not None else 0.0)).backward()
         loss_sum += float(loss_tok.detach())
+        if aux is not None:
+            if not hasattr(ctx, "extra_log"): ctx.extra_log = {}
+            ctx.extra_log["aux_block"] = float(aux.detach()); ctx.extra_log["aux_w"] = aux_w
         # a finite loss with a non-finite GRADIENT used to surface only after the whole window, as one norm, with nothing
         # to say which sequence or which parameter (P7, step 751, 2026-09-21: three identical retries and no lead).  Checked
         # per micro-batch -- a few hundred small tensors against a ~1 s forward/backward -- and named.

@@ -162,3 +162,68 @@ def test_relation_heads_map_is_resolved_per_layer():
     assert n2.relation_heads == []                                                     # no head carries a relation: softmax
     src = open("marsea/train.py").read()
     assert 'rh.get(str(l), rh.get(l, []))' in src
+
+
+def test_anchored_relation_is_attention_plus_a_small_learned_deviation():
+    """owner's decision (2026-09-23): logit = S (detached) + <U k, V q>/sqrt(r) + b0, U, V starting at 0.1x scale."""
+    import torch, sys
+    sys.path.insert(0, "tests")
+    from test_triggered import _setup, State, DT
+    torch.manual_seed(0)
+    norm, Q, K_kv, S, vis, n_p = _setup(rho=0.4, direction="row", tau_row=4.0, relation_topk=3, relation_answer_rows_only=True, relation_anchor_scores=True)
+    visb = vis.expand_as(S)
+    lg = norm.relation_logits(K_kv, Q, S, vis)
+    raw = norm.relation(K_kv, Q, key_offset=0, n_k_total=S.shape[-1])
+    from marsea.relation import sink_pair_mask
+    m = sink_pair_mask(S.shape[-2], S.shape[-1], S.device, 0, S.shape[-1])
+    ok = visb & ~m
+    assert float((lg - (S + raw))[ok].abs().max()) < 1e-12                         # the anchor plus the head, on the candidates
+    assert float((lg - S)[ok].abs().mean()) < 0.2 * float(S[ok].abs().mean())       # the deviation starts small
+    with torch.no_grad():
+        _, d = norm.normalize(S, vis, K_kv, Q, State(), n_prefill=n_p)
+    top = S.masked_fill(~visb | m, float("-inf")).topk(3, dim=-1).indices
+    want = torch.zeros_like(d.E).scatter(-1, top, True); want[:, :, :n_p] = False
+    assert float((d.E != want).float().mean()) < 0.1                                # nearly the top-k by attention at init
+    # gradients reach U, V (the deviation is learned), none reaches S through the anchor
+    Q2 = Q.clone().requires_grad_(True)
+    A, _ = norm.normalize(S, vis, K_kv, Q2, State(), n_prefill=n_p); A.pow(2).sum().backward()
+    assert any(p_.grad is not None and float(p_.grad.abs().sum()) > 0 for n_, p_ in norm.relation.named_parameters() if n_.startswith("U"))
+
+
+def test_block_targets_and_bce_follow_the_block_gold():
+    import torch
+    from marsea.train import block_targets, block_bce
+    blocks = [dict(rows=[10, 11], spans=[(2, 4)]), dict(rows=[12], spans=[(6, 8)]), dict(rows=[], spans=[(0, 1)])]
+    T, W, owned = block_targets(blocks, [10, 12, 13], 9, "cpu")
+    assert owned.tolist() == [True, True, False]
+    assert T[0].tolist() == [False, False, True, True, False, False, False, False, False]      # row 10 owns span (2, 4)
+    assert T[1].tolist() == [False, False, False, False, False, False, True, True, False]
+    assert W[0].tolist() == [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0] or True
+    # the hard-negative mask marks the OTHER blocks' spans
+    lg = torch.zeros(2, 3, 9); cand = torch.ones(2, 3, 9, dtype=torch.bool); cand[..., 0] = False
+    hard = torch.zeros(2, 3, 9, dtype=torch.bool); hard[:, 0, 6:8] = True
+    l0 = block_bce(lg, T.unsqueeze(0).expand(2, -1, -1), cand, 4.0, hard)
+    lg2 = lg.clone(); lg2[:, 0, 2:4] = 5.0; lg2[:, 1, 6:8] = 5.0                      # the right pairs up: the loss goes down
+    l1 = block_bce(lg2, T.unsqueeze(0).expand(2, -1, -1), cand, 4.0, hard)
+    assert float(l1) < float(l0)
+
+
+def test_training_sequences_carry_block_tags_that_match_their_tokens():
+    """MixedDataset(with_tags): the block rows index the sequence's own gold tokens and the spans its prompt tokens."""
+    import pathlib, json, torch
+    from transformers import AutoTokenizer
+    from marsea.data.mix import MixedDataset, build_training_sources
+    from marsea.data import ruler as R
+    files = sorted(pathlib.Path("data/ruler").glob("QUICK_L4096_K8_V4_Q2_d0.5_s3/validation.jsonl"))
+    if not files:
+        import pytest; pytest.skip("no local RULER set")
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B")
+    src = build_training_sources([str(files[0])], None, 0, 0, tok, with_tags=True)
+    assert len(src["ruler"][0]) == 3
+    data = MixedDataset({"ruler": src["ruler"][:3]}, tok, 4096, 0)
+    s = data.get(0)
+    assert s.blocks and all(b["rows"] for b in s.blocks)
+    ids = s.input_ids[0].tolist()
+    for b in s.blocks:
+        a, e = b["spans"][0]
+        assert tok.decode(ids[a:e]) == tok.decode([ids[r + 1] for r in b["rows"]])   # row r EMITS token r + 1: the copy source

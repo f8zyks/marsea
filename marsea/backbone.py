@@ -253,6 +253,8 @@ class MarSeaAttention(nn.Module):
         n_k = k.shape[-2]
         g = self.num_key_value_groups
         vis = build_vis(ctx.pad_mask, B, n_q, n_k, q.device)                     # [B,1,n_q,n_k]
+        if getattr(ctx, "aux_capture", False) and n_q == n_k:
+            ctx.aux_qk[self.layer_idx] = (k.detach(), q.detach(), self.scaling)   # the aux block loss recomputes S at the answer rows
         # ---- generation: frozen-prefix decode step on cached keys (Sec. 6.4)
         if ctx.generation and n_q == 1 and self.layer_idx in ctx.decode_caches and not ctx.phase_a and not ctx.force_empty \
                 and hasattr(self.normalizer, "tauK"):

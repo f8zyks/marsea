@@ -268,7 +268,7 @@ def _marsea_chunked_attention(norm, q, k_kv, v_kv, vis, state=None, chunk=1024, 
     if getattr(norm, "cap_mode", "row") != "row":
         raise NotImplementedError("cap_mode = relation runs on the dense path only so far (--mode dense)")
     if getattr(norm, "direction", None) is not None or getattr(norm, "relation_topk", 0) or getattr(norm, "relation_heads", None) is not None \
-            or getattr(norm, "relation_answer_rows_only", False):
+            or getattr(norm, "relation_answer_rows_only", False) or getattr(norm, "relation_anchor_scores", False) or getattr(norm, "relation_from_scores", False):
         raise NotImplementedError("the one-end forms and the partition relation run on the dense path only so far (--mode dense)")
     B, H, n_q, d = q.shape
     n_k = k_kv.shape[-2]

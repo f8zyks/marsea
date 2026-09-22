@@ -296,7 +296,8 @@ class MarSeaNormalizer(nn.Module):
                  tail_share_max: float = 0.5, tail_share_init: float = 0.05, tau_i_floor: float = 0.0,
                  tail_share_min: float = 0.0, relation_heads: Optional[list] = None, relation_topk: int = 0,
                  relation_answer_rows_only: bool = False, direction: Optional[str] = None, tau_row: float = 2.0,
-                 lam_row: float = 0.0, tau_col: float = 2.0, lam_col: float = 0.0, relation_from_scores: bool = False):
+                 lam_row: float = 0.0, tau_col: float = 2.0, lam_col: float = 0.0, relation_from_scores: bool = False,
+                 relation_anchor_scores: bool = False, anchor_init_scale: float = 0.1):
         super().__init__()
         assert quota_mode in ("inherited", "uniform")
         assert gate in ("st", "hard_concrete")
@@ -363,6 +364,17 @@ class MarSeaNormalizer(nn.Module):
         # head": P16a's row form GAINED mass on the rows whose relation held the copy source (0.90 -> 0.93) and lost it on the
         # rest (0.64 -> 0.48), and the learned head held the source on only 10-30 % of rows.
         self.relation_from_scores = bool(relation_from_scores)
+        # relation_anchor_scores (owner's decision, 2026-09-23):  logit_ij = S_ij (detached) + <U k_j, V q_i>/sqrt(r) + b0.
+        # The head starts as the row's top-k by attention (P16e's control: 96 % of copy sources in E) and learns only the
+        # DEVIATION from attention -- where exclusion lives (already-listed values pushed down).  U, V start at
+        # anchor_init_scale x their usual scale so the deviation begins small.
+        self.relation_anchor_scores = bool(relation_anchor_scores)
+        assert not (relation_from_scores and relation_anchor_scores)
+        if relation_anchor_scores:
+            with torch.no_grad():
+                for name_, p_ in self.relation.named_parameters():
+                    if name_.startswith("U") or name_.startswith("V"):
+                        p_.mul_(float(anchor_init_scale))
         assert direction in (None, "row", "column", "auto")
         self.direction = direction
         self.active_direction = direction if direction in ("row", "column") else None
@@ -414,10 +426,13 @@ class MarSeaNormalizer(nn.Module):
         """the relation logits for rows [row_offset, row_offset + n_q) -- the learned head, or the attention scores under
         relation_from_scores (sink pairs masked; no gradient)."""
         n_q, n_k = S.shape[-2:]
-        if self.relation_from_scores:
+        if self.relation_from_scores or self.relation_anchor_scores:
             from .relation import sink_pair_mask, SINK_LOGIT
             m = sink_pair_mask(n_q, n_k, S.device, 0, n_k)                      # row i sits at global n_k - n_q + i: the sink row only when n_q == n_k
-            return _fp(S).masked_fill(~vis.bool().expand_as(S), SINK_LOGIT).masked_fill(m, SINK_LOGIT).detach()
+            anchor = _fp(S).masked_fill(~vis.bool().expand_as(S), SINK_LOGIT).masked_fill(m, SINK_LOGIT).detach()
+            if self.relation_from_scores:
+                return anchor
+            return anchor + self.relation(K_kv, Q, key_offset=0, n_k_total=n_k, head_offset=head_offset).masked_fill(m, 0.0)
         return self.relation(K_kv, Q, key_offset=0, n_k_total=n_k, head_offset=head_offset)
 
     def select_E(self, logits: torch.Tensor, vis: torch.Tensor, head_offset: int = 0, first_row: int = 0, n_prefill: Optional[int] = None):
@@ -548,7 +563,7 @@ class MarSeaNormalizer(nn.Module):
             # ---- the relation (Sec. 4)
             if logits_override is not None:
                 logits = _fp(logits_override).expand(B, H, n_q, n_k)
-            elif self.relation_from_scores:
+            elif self.relation_from_scores or self.relation_anchor_scores:
                 logits = self.relation_logits(K_kv, Q, S32, vis, head_offset, row_offset=(getattr(self, "_first_row_dense", 0)))
             else:
                 logits = self.relation(K_kv, Q, key_offset=0, n_k_total=n_k, head_offset=head_offset)   # D-31 sink mask inside

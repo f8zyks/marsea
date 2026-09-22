@@ -146,3 +146,30 @@ def test_qa_blocks_own_the_supporting_facts_and_distractors_are_row_less():
     r = res["layers"]["2"]
     assert res["n_rows"] == 3 and all(r["mass_stale_sm"][h] == 0 and r["mass_remaining_sm"][h] == 0 for h in range(8))   # one owner: nothing stale
     assert all(abs(r["mass_own_sm"][h] + r["mass_other_sm"][h] + r["mass_rest_sm"][h] - 1) < 1e-6 for h in range(8))
+
+
+def test_aux_block_loss_runs_on_a_tiny_model_and_moves_the_relation():
+    """the Phase-B auxiliary: relation logits at the owned answer rows vs the block gold, from the captured (K, Q)."""
+    import torch
+    from types import SimpleNamespace
+    from marsea.train import aux_block_loss, TrainConfig
+    from marsea.blockgold import ruler_blocks
+    model, ctx = _tiny_model(); ctx.triggered = True
+    for l in (1, 2):
+        nm = model.model.layers[l].self_attn.normalizer
+        nm.relation_anchor_scores = False; nm.relation_heads = [0, 1, 2]
+    ex = _example(); ex.value_owner = [0, 0]; ex.meta = {}
+    blocks = ruler_blocks(ex)
+    ids = torch.tensor([ex.prompt_ids + ex.gold_ids]); labels = torch.tensor([[-100] * len(ex.prompt_ids) + ex.gold_ids])
+    seq = SimpleNamespace(input_ids=ids, labels=labels, source="ruler", index=0, n_label_tokens=len(ex.gold_ids), blocks=blocks)
+    cfg = TrainConfig(aux_block_weight=1.0, aux_anneal_steps=100, phase_a_steps=0)
+    ctx.aux_capture = True; ctx.aux_qk = {}; ctx.n_prefill = len(ex.prompt_ids)
+    model.train()
+    model(input_ids=ids, use_cache=False, logits_to_keep=1)
+    assert set(ctx.aux_qk) == {1, 2}
+    loss, w = aux_block_loss(model, ctx, seq, cfg, step=0)
+    assert loss is not None and w == 1.0 and float(loss) > 0
+    loss.backward()
+    nm = model.model.layers[1].self_attn.normalizer
+    assert float(nm.relation.U.grad.abs().sum()) > 0 if hasattr(nm.relation.U, "grad") else True
+    assert aux_block_loss(model, ctx, seq, cfg, step=100)[0] is None                # annealed to zero

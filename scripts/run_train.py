@@ -35,6 +35,9 @@ def main():
     ap.add_argument("--warmstart_mass", type=float, default=0.10); ap.add_argument("--warmstart_lr", type=float, default=3e-3)
     ap.add_argument("--warmstart_answer_rows_only", action="store_true", help="fit the relation on the answer rows only")
     ap.add_argument("--warmstart_sequences", type=int, default=24, help="sequences the warm start cycles through")
+    ap.add_argument("--warmstart_targets", default="attention", choices=["attention", "blocks"], help="the warm start's targets: the model's high-mass pairs, or the BLOCK GOLD")
+    ap.add_argument("--aux_block_weight", type=float, default=0.0, help="Phase B: auxiliary BCE of the relation logits against the block gold (annealed to 0)")
+    ap.add_argument("--aux_anneal_steps", type=int, default=1000); ap.add_argument("--aux_hard_negative_weight", type=float, default=4.0)
     ap.add_argument("--warmstart_min_distance", type=int, default=0, help="a warm-start target pair spans at least this many tokens")
     ap.add_argument("--rho0", type=float, default=0.05, help="relation coverage the b0 calibration targets (per head with relation_per_head)")
     ap.add_argument("--recal_every", type=int, default=0, help="re-bisect b0 to rho0 every N Phase-B steps")
@@ -56,7 +59,8 @@ def main():
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.backbone)
     ruler_files = [f for pat in args.ruler_train for f in sorted(glob.glob(pat if pat.endswith(".jsonl") else pat + "/validation.jsonl"))]
-    sources = build_training_sources(ruler_files, args.musique, args.hotpot_n, args.seed, tok, cache_dir=pathlib.Path(args.out) / "cache")
+    with_tags = bool(args.aux_block_weight > 0 or args.warmstart_targets == "blocks")
+    sources = build_training_sources(ruler_files, args.musique, args.hotpot_n, args.seed, tok, cache_dir=pathlib.Path(args.out) / "cache", with_tags=with_tags)
     assert sources, "no training sources"
     data = MixedDataset(sources, tok, args.L, args.seed, cache_dir=pathlib.Path(args.out) / "cache")
     cfg = TrainConfig(arm=args.arm, seed=args.seed, backbone=args.backbone, L=args.L, total_steps=args.total_steps,
@@ -67,7 +71,8 @@ def main():
                       phase_a_patched=not args.phase_a_unpatched, phase_a_ckpt=args.phase_a_ckpt, phase_a_only=args.phase_a_only,
                       allow_phase_a_layer_change=args.allow_phase_a_layer_change,
                       relation_warmstart_steps=args.relation_warmstart_steps, warmstart_mass=args.warmstart_mass,
-                      warmstart_lr=args.warmstart_lr, warmstart_answer_rows_only=args.warmstart_answer_rows_only, warmstart_sequences=args.warmstart_sequences,
+                      warmstart_lr=args.warmstart_lr, warmstart_answer_rows_only=args.warmstart_answer_rows_only, warmstart_sequences=args.warmstart_sequences, warmstart_targets=args.warmstart_targets,
+                      aux_block_weight=args.aux_block_weight, aux_anneal_steps=args.aux_anneal_steps, aux_hard_negative_weight=args.aux_hard_negative_weight,
                       warmstart_min_distance=args.warmstart_min_distance, rho0=args.rho0, recal_every=args.recal_every, st_T0=args.st_T0,
                       st_anneal_steps=args.st_anneal_steps, module_warmup_steps=args.module_warmup_steps,
                       gate_min_relation_recall=args.gate_min_relation_recall, gate_after=args.gate_after, triggered=args.triggered, monitor_every=args.monitor_every)

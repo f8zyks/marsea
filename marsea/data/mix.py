@@ -22,6 +22,8 @@ class Sequence:
     source: str
     index: int
     n_label_tokens: int
+    blocks: Optional[list] = None    # the BLOCK GOLD (blockgold.blocks_of): [{rows, spans, ...}] in this sequence's positions,
+                                     # when the source carries its records (build_training_sources(..., with_tags=True))
 
 
 class MixedDataset:
@@ -50,7 +52,8 @@ class MixedDataset:
             if f.exists():
                 return json.loads(f.read_text())
         lengths = []
-        for (p, g) in items:
+        for item in items:
+            p, g = item[0], item[1]
             lengths.append(len(self.tok(p, add_special_tokens=False)["input_ids"]) + len(self.tok(g, add_special_tokens=False)["input_ids"]) + 1)
         if cache_dir is not None:
             pathlib.Path(cache_dir).mkdir(parents=True, exist_ok=True)
@@ -65,24 +68,45 @@ class MixedDataset:
         name = self.names[cursor % len(self.names)]
         perm = self.perms[name]
         idx = perm[(cursor // len(self.names)) % len(perm)]
-        prompt, gold = self.sources[name][idx]
+        item = self.sources[name][idx]; prompt, gold = item[0], item[1]
         p_ids = self.tok(prompt, add_special_tokens=False)["input_ids"]
         g_ids = self.tok(gold, add_special_tokens=False)["input_ids"] + [self.eos_id]
         ids = torch.tensor([p_ids + g_ids])
         labels = torch.tensor([[-100] * len(p_ids) + g_ids])
-        return Sequence(ids, labels, name, idx, len(g_ids))
+        blocks = self._blocks(item, p_ids, g_ids) if len(item) > 2 and item[2] is not None else None
+        return Sequence(ids, labels, name, idx, len(g_ids), blocks)
+
+    def _blocks(self, item, p_ids, g_ids):
+        """the block gold of one sequence, built on the fly from its record (RULER) or its QAExample (QA); the rows are
+        positions in prompt + gold, as train_step's labels index them.  A record whose spans cannot be built gives []."""
+        from ..blockgold import blocks_of
+        from .ruler import build_example
+        from .qa import QAExample, tokenize_example
+        payload = item[2]
+        try:
+            if isinstance(payload, QAExample):
+                ex = tokenize_example(payload, self.tok) if not payload.prompt_ids else payload
+            else:
+                ex = build_example(payload, self.tok)
+            if list(ex.prompt_ids) != list(p_ids):                             # the same tokenizer, the same prompt: they must agree
+                return []
+            return blocks_of(ex)
+        except Exception:
+            return []
 
 
 def build_training_sources(ruler_jsonls: list, musique_path: Optional[str], hotpot_n: int, seed: int, tok=None,
-                           hotpot_split: str = "train", cache_dir=None) -> dict:
-    """assemble (prompt, gold) pairs per source (training procedure Sec. 2.1)."""
-    from .ruler import load_jsonl
+                           hotpot_split: str = "train", cache_dir=None, with_tags: bool = False) -> dict:
+    """assemble (prompt, gold) pairs per source (training procedure Sec. 2.1).  with_tags: each item also carries its
+    record / QAExample, from which MixedDataset builds the BLOCK GOLD of the sequence (the relation's targets, 2026-09-23)."""
+    from .ruler import load_jsonl, load_set
     from .qa import load_musique, musique_example, load_hotpot, hotpot_example
     out = {}
     ruler = []
     for path in ruler_jsonls:
-        for rec in load_jsonl(path):
-            ruler.append((rec["input"] + rec["answer_prefix"], " " + ", ".join(str(o) for o in rec["outputs"])))
+        for rec in (load_set(path) if with_tags else load_jsonl(path)):       # load_set attaches the config (VT records need it)
+            item = (rec["input"] + rec["answer_prefix"], " " + ", ".join(str(o) for o in rec["outputs"]))
+            ruler.append(item + (rec,) if with_tags else item)
     if ruler: out["ruler"] = ruler
     # every source the caller NAMES must arrive.  MuSiQue used to be skipped when its file was absent (it is a manual
     # Google-Drive download nothing verifies) and HotpotQA's failure was caught and printed, so an arm could train on
@@ -93,12 +117,12 @@ def build_training_sources(ruler_jsonls: list, musique_path: Optional[str], hotp
         if not pathlib.Path(musique_path).exists():
             raise FileNotFoundError(f"MuSiQue training file {musique_path} is missing (manual download; see RUNBOOK_nebius.md)")
         recs = load_musique(musique_path)
-        out["musique"] = [(ex.prompt, ex.gold) for ex in (musique_example(r, seed) for r in recs)]
+        out["musique"] = [((ex.prompt, ex.gold, ex) if with_tags else (ex.prompt, ex.gold)) for ex in (musique_example(r, seed) for r in recs)]
         if not out["musique"]:
             raise RuntimeError(f"MuSiQue training file {musique_path} yielded no examples")
     if hotpot_n:
         ds = load_hotpot(hotpot_split, n=hotpot_n, seed=seed, cache_dir=cache_dir)     # raises if unavailable
-        out["hotpot"] = [(ex.prompt, ex.gold) for ex in (hotpot_example(r, seed) for r in ds)]
+        out["hotpot"] = [((ex.prompt, ex.gold, ex) if with_tags else (ex.prompt, ex.gold)) for ex in (hotpot_example(r, seed) for r in ds)]
         if not out["hotpot"]:
             raise RuntimeError("HotpotQA yielded no training examples")
     return out
