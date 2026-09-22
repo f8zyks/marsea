@@ -296,7 +296,7 @@ class MarSeaNormalizer(nn.Module):
                  tail_share_max: float = 0.5, tail_share_init: float = 0.05, tau_i_floor: float = 0.0,
                  tail_share_min: float = 0.0, relation_heads: Optional[list] = None, relation_topk: int = 0,
                  relation_answer_rows_only: bool = False, direction: Optional[str] = None, tau_row: float = 2.0,
-                 lam_row: float = 0.0):
+                 lam_row: float = 0.0, tau_col: float = 2.0, lam_col: float = 0.0):
         super().__init__()
         assert quota_mode in ("inherited", "uniform")
         assert gate in ("st", "hard_concrete")
@@ -352,10 +352,19 @@ class MarSeaNormalizer(nn.Module):
         #       output depends on its own row alone, so teacher forcing IS decoding (no triggered form needed).
         #   direction = "column" (QA: answer rows are the one-end, supporting tokens the many-end)  column programme only.
         #   None: the v2 mechanism (both programmes).  tau_row, lam_row are PRESETS, not learned.
-        assert direction in (None, "row", "column")
+        #   direction = "auto": per SEQUENCE, from the task (train_step / the evaluators set ctx.relation_direction; the
+        #       backbone copies it to `active_direction` before each forward) -- one model trains on both kinds of task.
+        #   The column form: A_jE = (R_j + lam_col T_j) sparsemax(tau_col S_jE) over the column's members among the rows so
+        #       far; a generated non-member row of a column with a relation is emitted at (1 - lam_col) A_sm; NO cap after
+        #       (the softmax at the start is the unit normalisation; a one-end row may carry > 1).  Column membership grows as rows
+        #       are generated, so it runs on the triggered form with tau_col in place of TauKTrigger.
+        assert direction in (None, "row", "column", "auto")
         self.direction = direction
-        self.tau_row = float(tau_row); self.lam_row = float(lam_row)
-        assert 0.0 <= self.lam_row < 1.0 and self.tau_row > 0
+        self.active_direction = direction if direction in ("row", "column") else None
+        self.tau_row = float(tau_row); self.lam_row = float(lam_row); self.tau_col = float(tau_col); self.lam_col = float(lam_col)
+        assert 0.0 <= self.lam_row < 1.0 and self.tau_row > 0 and 0.0 <= self.lam_col < 1.0 and self.tau_col > 0
+        if direction in ("column", "auto"):
+            assert relation_answer_rows_only, "the column form's members are generated rows: it needs relation_answer_rows_only"
         self.tauK = TauK(d_head, hidden, tau_min, zero_field_inputs=key_only_tau, no_nu=no_nu, per_head=per_head)
         # tau_i_floor = 1: fan-in step 2 can only SHARPEN.  With tau_i < 1 its quota cbar_i / tau_i exceeds what the relation
         # holds, the projection is the identity and the final relation is tau_i x Atil_E: the difference leaves the row
@@ -447,7 +456,7 @@ class MarSeaNormalizer(nn.Module):
 
     def _dispatch_one(self, S, vis, K_kv, Q, state=None, *, n_prefill=None, decode_K_ret: int = 64, head_offset: int = 0,
                       logits_override=None, tau_j_override=None, tau_i_override=None, E_override=None):
-        if n_prefill is not None and self.direction == "row":
+        if n_prefill is not None and self.active_direction == "row":
             # row-local: the full-sequence form IS the triggered form; prompt rows are known through prompt_rows
             self._n_prefill_dense = int(n_prefill)
             return self._normalize_one(S, vis, K_kv, Q, state, logits_override=logits_override, head_offset=head_offset)
@@ -533,7 +542,7 @@ class MarSeaNormalizer(nn.Module):
                 g, E = hard_concrete_gate((logits > 0) & vis, logits, vis, self.gate_temperature, self.training)
             else:
                 E, g = self.select_E(logits, vis, head_offset, first_row=getattr(self, "_first_row_dense", 0), n_prefill=getattr(self, "_n_prefill_dense", None))
-            if self.direction == "row":
+            if self.active_direction == "row":
                 return self._row_constrained(S32, vis, A_sm, E, g, logits, c, state, out_dtype)
             # ---- STEP 1 fan-out: the inherited quota reads A_sm, NEVER S     (eq:step1)
             cbar_j = (g * A_sm).sum(-2)                                      # [B,H,n_k]   ST site (1)

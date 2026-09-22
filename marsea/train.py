@@ -876,6 +876,7 @@ def train_step(model, ctx, opt, data, cursor, step, cfg, log, head_lr_scale=1.0)
         ids = s.input_ids.to(dev); labels = s.labels.to(dev)
         keep = torch.nonzero(labels[0, 1:] != -100).flatten()                   # positions that PREDICT a labelled token
         ctx.n_prefill = n_prompt_tokens(labels)                                 # read by the triggered form only; it stays set
+        ctx.relation_direction = "column" if s.source in ("musique", "hotpot") else "row"   # v3 "auto": the task's one-end direction
                                                                                 # through backward (checkpointed layers recompute)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             # no KV cache (a checkpointed recompute must not append to it); only the answer positions' logits are built

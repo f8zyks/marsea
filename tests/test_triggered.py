@@ -459,3 +459,54 @@ def test_row_constrained_whole_model_teacher_forced_equals_cached_decoding():
         ctx.generation = False; ctx.decode_caches = {}
     dec = torch.stack(outs)
     assert float((dec - full).abs().max()) < 1e-7
+
+
+# --------------------------------------------------------------------------- MarSea v3: the column-constrained one-end form
+@pytest.mark.parametrize("K_ret,lam,tau", [(64, 0.0, 2.0), (3, 0.25, 4.0), (64, 0.5, 1.0)])
+def test_column_constrained_form_equals_decoding_and_obeys_its_mass_rules(K_ret, lam, tau):
+    """owner's design (2026-09-22): QA -- answer rows are the one-end, supporting tokens the many-end.  Column j hands
+    R_j + lam T_j (over the rows so far) to its members by sparsemax(tau S) at trigger time; a generated non-member row of
+    a column with a relation is emitted at (1 - lam) A_sm; no cap after (the softmax is the unit normalisation).
+    Teacher-forced == decode."""
+    norm, Q, K_kv, S, vis, n_p = _setup(rho=0.4, direction="column", tau_col=tau, lam_col=lam, relation_topk=4,
+                                        relation_answer_rows_only=True, relation_heads=[0, 2, 5])
+    A_p, A_dec = _by_decoding(norm, Q, K_kv, S, vis, n_p, K_ret)
+    with torch.no_grad():
+        A, d = norm.normalize(S, vis, K_kv, Q, State(), n_prefill=n_p, decode_K_ret=K_ret)
+    T = S.shape[-1]; E = d.E; visb = vis.expand_as(E)
+    assert float((A[:, :, n_p:] - A_dec).abs().max()) < 1e-9 and torch.equal(A[:, :, :n_p, :n_p], A_p)
+    assert bool((E[:, :, :n_p] == False).all()) and bool((E[:, [1, 3, 4]] == False).all())
+    # every row within one unit; a head without a relation is softmax; prompt rows untouched
+    assert torch.equal(A[:, [1, 3, 4]], d.A_sm[:, [1, 3, 4]]) and torch.equal(A[:, :, :n_p], d.A_sm[:, :, :n_p])
+    assert not bool(d.cap_binds.any())                                                  # no cap after the column programme
+    # the rules on every answer row: members take budget x share (a member row may carry MORE than one unit), non-members
+    # of an ACTIVE column are scaled by (1 - lam), everything else is softmax
+    Asm = d.A_sm
+    for h in (0, 2, 5):
+        for t in range(n_p, T):
+            members_so_far = E[0, h, :t + 1]                                         # [t+1, n]: rows <= t
+            active = members_so_far.any(0)
+            for j in range(t + 1):
+                if bool(E[0, h, t, j]):
+                    R = float((Asm[0, h, :t + 1, j] * members_so_far[:, j]).sum()); Tm = float((Asm[0, h, :t + 1, j] * ~members_so_far[:, j]).sum())
+                    assert A[0, h, t, j] <= (R + lam * Tm) + 1e-9
+                elif bool(active[j]):
+                    assert abs(float(A[0, h, t, j] - (1 - lam) * Asm[0, h, t, j])) < 1e-9
+                else:
+                    assert abs(float(A[0, h, t, j] - Asm[0, h, t, j])) < 1e-12
+    # the ST gradient reaches the relation
+    norm.zero_grad(); A3, _ = norm.normalize(S, vis, K_kv, Q, State(), n_prefill=n_p, decode_K_ret=K_ret); A3.pow(2).sum().backward()
+    assert any(p_.grad is not None and float(p_.grad.abs().sum()) > 0 for n_, p_ in norm.relation.named_parameters() if n_.startswith("U"))
+
+
+def test_auto_direction_switches_per_sequence():
+    """direction "auto": the backbone copies ctx.relation_direction into the normaliser before each forward."""
+    norm, Q, K_kv, S, vis, n_p = _setup(rho=0.4, direction="auto", tau_row=3.0, tau_col=3.0, relation_topk=4, relation_answer_rows_only=True)
+    with torch.no_grad():
+        norm.active_direction = "row"; A_r, d_r = norm.normalize(S, vis, K_kv, Q, State(), n_prefill=n_p)
+        norm.active_direction = "column"; A_c, d_c = norm.normalize(S, vis, K_kv, Q, State(), n_prefill=n_p)
+    assert d_r.extra.get("direction") == "row" and d_c.extra.get("triggered") is not None
+    assert float((A_r - A_c).abs().max()) > 1e-3                                      # the two forms differ on the same input
+    src = open("marsea/backbone.py").read(); tr = open("marsea/train.py").read()
+    assert 'self.normalizer.active_direction = ctx.relation_direction or "row"' in src
+    assert 'ctx.relation_direction = "column" if s.source in ("musique", "hotpot") else "row"' in tr

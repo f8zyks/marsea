@@ -426,6 +426,8 @@ def evaluate_ruler(model, tok, ctx: MarSeaContext, examples: list[RULERExample],
     """column_measurable: True, False, or {'coref': bool, 'value': bool} (S0's licence per T_j kind, spec Sec. 12.3).  Columns
     of a kind that S0 did not license are dropped and the record says so, so the tables read 'not measurable on this
     backbone' for that kind instead of carrying numbers."""
+    ctx.relation_direction = "row"                                               # NIAH / VT: value tokens are the one-end
+
     dense = arm.lower() in ("b0", "b1", "b2")
     rows = []
     for k, ex in enumerate(examples):
@@ -471,6 +473,8 @@ def evaluate_qa(model, tok, ctx: MarSeaContext, examples: list[QAExample], l_sta
     """paired_E: as for evaluate_ruler.  E5's dense arms were scored on the full visible column while RULER's were
     scored on the paired relation -- two measurements of the quantity D-9a's provenance work exists for, under one
     table (review e982f83 G)."""
+    ctx.relation_direction = "column"                                            # QA: answer rows are the one-end
+
     dense = arm.lower() in ("b0", "b1", "b2")
     sites = kind_site_map(kind_sites=kind_sites)
     rows = []

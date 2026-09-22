@@ -85,6 +85,7 @@ class FrozenPrefixCache:
     rel_count: Optional[torch.Tensor] = None       # [B,H,n_k]   the TRUE size of E_.j so far (the lists are truncated at K_ret)
     n_seen: int = 0                                # queries seen so far (prefix length)
     n_prefill: Optional[int] = None                # rows < n_prefill are prompt rows (relation_answer_rows_only)
+    col_mass: Optional[torch.Tensor] = None        # [B,H,n_k]   sum of A_sm over the rows so far (the column form's R_j + T_j)
     Q_hist: Optional[torch.Tensor] = None          # [B,H,T,d] post-RoPE queries (seal-at-boundary only)
     # Two different events, counted separately (review e982f83 E).  One integer used to add them, so E8's "k* near
     # K_ret" reading and D-28's cache-loss reading could not be told apart -- and fixing the dense/chunked parity
@@ -108,6 +109,7 @@ class FrozenPrefixCache:
         self.tau_j = diag.tau_j.detach().clone()
         self.cbar_j = diag.cbar_j.detach().clone()
         self.nu = diag.nu.detach().clone()
+        self.col_mass = diag.c.detach().clone() if diag.c is not None else None
         Srel = S32.masked_fill(~E, NEG_PAD).transpose(-1, -2)                  # [B,H,n_k,n_q]
         k = min(K, n_q)
         top = torch.topk(Srel, k, dim=-1, largest=True, sorted=True)
@@ -202,6 +204,8 @@ class FrozenPrefixCache:
         self.tau_j = torch.cat([self.tau_j, tau_new], -1)
         self.cbar_j = torch.cat([self.cbar_j, cbar_new], -1)
         self.nu = torch.cat([self.nu, nu_new], -1)
+        if self.col_mass is not None:
+            self.col_mass = torch.cat([self.col_mass, torch.zeros_like(cbar_new)], -1)
         if self.rel_count is not None:
             self.rel_count = torch.cat([self.rel_count, torch.zeros((B, H, 1), dtype=self.rel_count.dtype, device=dev)], -1)
         self.rel_scores = torch.cat([self.rel_scores, torch.full((B, H, 1, K), NEG_PAD, dtype=self.rel_scores.dtype, device=dev)], -2)
@@ -276,7 +280,9 @@ def decode_step(norm: MarSeaNormalizer, cache: FrozenPrefixCache, S_row: torch.T
     if cache.rel_count is not None:
         cache.rel_count = cache.rel_count + E_j.long()
     tau_use = cache.tau_j
-    if getattr(norm, "tauK_trig", None) is not None:
+    if getattr(norm, "active_direction", None) == "column":
+        tau_use = torch.full_like(cache.tau_j, norm.tau_col)
+    elif getattr(norm, "tauK_trig", None) is not None:
         # the trigger-time temperature: predicted from the column as it stands now, for the columns row t triggers
         from .heads import trigger_stats
         st = trigger_stats(cache.rel_scores, cache.rel_valid, cache.rel_count, s_j)
@@ -288,6 +294,32 @@ def decode_step(norm: MarSeaNormalizer, cache: FrozenPrefixCache, S_row: torch.T
     p2 = (p_list * p_list).sum(-1)
     has_rel = cache.rel_valid.any(-1)
     cache.nu = torch.where(has_rel, 1.0 / torch.where(has_rel, p2.clamp_min(1e-12), torch.ones_like(p2)), torch.ones_like(p2))
+    if getattr(norm, "active_direction", None) == "column":
+        # the column form (see MarSeaNormalizer.__init__): quota R_j + lam_col T_j over the rows so far, tau_col preset,
+        # a non-member row of a column with a relation at (1 - lam_col) A_sm; no cap after (the softmax is the unit normalisation)
+        a_row = A_sm[..., 0, :]
+        if cache.col_mass is None:
+            cache.col_mass = torch.zeros_like(cache.cbar_j)
+        cache.col_mass = cache.col_mass + a_row                                     # rows so far incl. t
+        tail_j = cache.col_mass - cache.cbar_j
+        budget = cache.cbar_j + norm.lam_col * tail_j
+        active = cache.rel_count > 0 if cache.rel_count is not None else has_rel
+        scale = torch.where(active & ~E_j, 1.0 - norm.lam_col, 1.0)
+        Atil_row = torch.where(E_j, budget * p_new, a_row * scale).unsqueeze(-2)
+        excess = Atil_row.sum(-1) - A_sm.sum(-1); sm_mass = A_sm.sum(-1)
+        a1 = Atil_row                                                                # no cap after the column programme
+        cap_theta = torch.zeros(B, H, 1, dtype=S32.dtype, device=S32.device); cap_binds = torch.zeros(B, H, 1, dtype=torch.bool, device=S32.device)
+        Ef = E_row.to(S32.dtype)
+        A_row = a1; cbar_i = (A_row * Ef).sum(-1); Rtil = (Atil_row * Ef).sum(-1); theta = torch.zeros_like(cbar_i)
+        tau_i = torch.ones(B, H, 1, dtype=S32.dtype, device=S32.device)
+        cache.n_seen = t + 1
+        info = dict(E=E_row, cbar_i=cbar_i, tau_i=tau_i, theta=theta, Rtil=Rtil, Atil=Atil_row, a1=a1, A_sm=A_sm,
+                    supp_rel=((A_row > 0) & E_row).sum(-1), cap_binds=cap_binds, cap_theta=cap_theta, excess=excess, sm_mass=sm_mass,
+                    kstar_new=(p_new > 0).sum(-1), eviction_events=cache.eviction_events, near_truncation_events=cache.near_truncation_events,
+                    tau_j=cache.tau_j, nu=cache.nu)
+        return A_row, info
+    if cache.col_mass is not None:
+        cache.col_mass = cache.col_mass + A_sm[..., 0, :]
     Atil_row = torch.where(E_j, cache.cbar_j * p_new, A_sm[..., 0, :]).unsqueeze(-2)   # [B,H,1,n_k]; ONLY row t
     # ---- fan-in step 1 / 2 on row t (row-local; exactly Sec. 5)
     one = torch.ones(B, H, 1, dtype=S32.dtype, device=S32.device)

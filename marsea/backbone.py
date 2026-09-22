@@ -121,6 +121,7 @@ class MarSeaContext:
     capture_inputs: bool = False
     triggered: bool = False                              # the TRIGGERED teacher-forced form (marsea/triggered.py): a full pass
     n_prefill: Optional[int] = None                      #   computes what prefill (rows < n_prefill) + decoding computes
+    relation_direction: Optional[str] = None             # MarSea v3 "auto": the current sequence's one-end direction ("row" | "column")
     baseline_head_block: Optional[int] = None            # EVALUATION of B0/B1/B2/B4: that many Q-heads at a time on the
                                                          # dense path (see _baseline_by_head_block)
 
@@ -256,6 +257,8 @@ class MarSeaAttention(nn.Module):
         if ctx.generation and n_q == 1 and self.layer_idx in ctx.decode_caches and not ctx.phase_a and not ctx.force_empty \
                 and hasattr(self.normalizer, "tauK"):
             from .causal import decode_step
+            if getattr(self.normalizer, "direction", None) == "auto":
+                self.normalizer.active_direction = ctx.relation_direction or "row"
             k_rep = repeat_kv(k, g)
             S = (torch.matmul(q, k_rep.transpose(2, 3)) * self.scaling)
             with torch.autocast(device_type=q.device.type, enabled=False):
@@ -354,6 +357,8 @@ class MarSeaAttention(nn.Module):
                     # on `~E` with E = None (eval smoke test, 2026-09-19).  Without head blocking E is always there,
                     # which is why no test saw it.
                     self.normalizer.want_E = bool(ctx.collect or self.normalizer.want_dense_diag or ctx.generation)
+                if getattr(self.normalizer, "direction", None) == "auto":
+                    self.normalizer.active_direction = ctx.relation_direction or "row"
                 if trig:                                                          # prompt rows as the prefill, answer rows as decode steps
                     kw["n_prefill"] = int(ctx.n_prefill); kw["decode_K_ret"] = int(ctx.K_ret)
                 elif getattr(self.normalizer, "relation_answer_rows_only", False) and n_q == n_k:

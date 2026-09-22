@@ -94,7 +94,10 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
         S_aT = S_a.transpose(-1, -2); E_aT = E_a.transpose(-1, -2)                  # [B,H,n,m]: the answer rows of each key
         trig_tau = getattr(norm, "tauK_trig", None)
         learned_share = getattr(norm, "tail_share_head", None) is not None
-        if trig_tau is not None or norm.tauQ.sized or learned_share:                                 # the TRUE size of each relation set, row by row
+        col_form = getattr(norm, "active_direction", None) == "column"
+        if col_form:
+            trig_tau = None                                                          # tau_col is a preset
+        if trig_tau is not None or norm.tauQ.sized or learned_share or col_form:     # the TRUE size of each relation set, row by row
             cnt_run = torch.cat([d_p.E.sum(-2), torch.zeros(B, H, m, dtype=torch.long, device=dev)], -1).unsqueeze(-2) + torch.cumsum(E_a.long(), dim=-2)
         if trig_tau is not None:
             k_all = repeat_kv(_fp(K_kv), g_kv)                                      # [B,H,n,d]
@@ -116,7 +119,9 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
             kk = min(K_ret, cand.shape[-1])
             top = torch.topk(cand.masked_fill(~cval, NEG_PAD), kk, dim=-1)
             tval = torch.gather(cval, -1, top.indices)
-            if trig_tau is None:
+            if col_form:
+                tau_c = torch.full((B, H, rb, A_max, 1), norm.tau_col, dtype=dt, device=dev)
+            elif trig_tau is None:
                 tau_c = torch.gather(tau_all.unsqueeze(2).expand(B, H, rb, n_k), -1, order).unsqueeze(-1)   # sealed
             else:                                                                   # predicted NOW, from the column as it stands
                 # the PADDED slots (a row with fewer active columns than the block's widest) must reach the MLP with finite
@@ -132,19 +137,35 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
             p_rows.append(torch.zeros(B, H, rb, n_k, dtype=dt, device=dev).scatter(-1, order, p_new))
             tau_rows.append(torch.zeros(B, H, rb, n_k, dtype=dt, device=dev).scatter(-1, order, (tau_c.squeeze(-1) * act.to(dt)).detach()))
         p_a = torch.cat(p_rows, -2)                                                 # [B,H,m,n]; 0 off E
-        Atil_a = A_sm_a + g_a * (cbar_run * p_a - A_sm_a)                           # ST site 2
-        # ---- the row programme, row-local: identical to the dense form's
-        excess, sm_mass = row_masses(Atil_a, A_sm_a, E_a)
-        a1_a, cap_theta_a, cap_binds_a = apply_unit_cap(norm, Atil_a, A_sm_a, E_a, vis_a, excess, sm_mass, Q=Q[:, :, n_p:],
-                                                        col_size=cnt_run if learned_share else None, p=p_a, head_offset=head_offset)
-        cbar_i_a = (g_a * a1_a).sum(-1)                                             # ST site 3
-        Rtil_a = (Atil_a * E_a.to(dt)).sum(-1)
-        if norm.tau_i_pinned:
-            tau_i_a = torch.ones(B, H, m, dtype=dt, device=dev)
+        if col_form:
+            # the column form (owner, 2026-09-22): quota = R_j + lam_col T_j over the rows so far; a non-member row of a
+            # column with a relation is emitted at (1 - lam_col) A_sm
+            tail_run = torch.cat([d_p.c - d_p.cbar_j, zeros_m], -1).unsqueeze(-2) + torch.cumsum((1.0 - g_a) * A_sm_a, dim=-2)
+            budget_run = cbar_run + norm.lam_col * tail_run                          # [B,H,m,n]
+            active = cnt_run > 0
+            scale = torch.where(active & ~E_a, 1.0 - norm.lam_col, 1.0)
+            Atil_a = A_sm_a * scale + g_a * (budget_run * p_a - A_sm_a * scale)      # on E: the column's assignment
+            # no cap after the column programme (owner, 2026-09-22): the unit normalisation is the softmax at its start;
+            # a one-end row that wins several columns carries more than one unit
+            A_a = a1_a = Atil_a
+            cap_theta_a = torch.zeros(B, H, m, dtype=dt, device=dev); cap_binds_a = torch.zeros(B, H, m, dtype=torch.bool, device=dev)
+            cbar_i_a = (A_a * E_a.to(dt)).sum(-1); Rtil_a = (Atil_a * E_a.to(dt)).sum(-1)
+            tau_i_a = torch.ones(B, H, m, dtype=dt, device=dev); theta_a = torch.zeros(B, H, m, dtype=dt, device=dev); u_a = p_a
         else:
-            tau_i_a = norm.tauQ(_fp(Q[:, :, n_p:]), norm.tauQ.summary(Atil_a, E_a, vis_a, cbar_i_a, Rtil_a, col_size=cnt_run if norm.tauQ.sized else None, p=p_a), head_offset)
-        u_a, theta_a = proj_le_masked(Atil_a.masked_fill(~E_a, 0.0), cbar_i_a / tau_i_a, E_a)
-        A_a = a1_a + g_a * (tau_i_a.unsqueeze(-1) * u_a - a1_a)                     # ST site 4
+            Atil_a = A_sm_a + g_a * (cbar_run * p_a - A_sm_a)                           # ST site 2
+        # ---- the row programme, row-local: identical to the dense form's
+        if not col_form:
+          excess, sm_mass = row_masses(Atil_a, A_sm_a, E_a)
+          a1_a, cap_theta_a, cap_binds_a = apply_unit_cap(norm, Atil_a, A_sm_a, E_a, vis_a, excess, sm_mass, Q=Q[:, :, n_p:],
+                                                          col_size=cnt_run if learned_share else None, p=p_a, head_offset=head_offset)
+          cbar_i_a = (g_a * a1_a).sum(-1)                                             # ST site 3
+          Rtil_a = (Atil_a * E_a.to(dt)).sum(-1)
+          if norm.tau_i_pinned:
+              tau_i_a = torch.ones(B, H, m, dtype=dt, device=dev)
+          else:
+              tau_i_a = norm.tauQ(_fp(Q[:, :, n_p:]), norm.tauQ.summary(Atil_a, E_a, vis_a, cbar_i_a, Rtil_a, col_size=cnt_run if norm.tauQ.sized else None, p=p_a), head_offset)
+          u_a, theta_a = proj_le_masked(Atil_a.masked_fill(~E_a, 0.0), cbar_i_a / tau_i_a, E_a)
+          A_a = a1_a + g_a * (tau_i_a.unsqueeze(-1) * u_a - a1_a)                     # ST site 4
         # ---- the hand-off to the next patched layer: the prefill's nu for the prompt keys, 1 for a key sealed at arrival
         nu_all = torch.cat([d_p.nu, torch.ones(B, H, m, dtype=dt, device=dev)], -1)
         if state is not None:
