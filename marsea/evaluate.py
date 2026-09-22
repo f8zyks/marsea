@@ -454,6 +454,9 @@ def evaluate_ruler(model, tok, ctx: MarSeaContext, examples: list[RULERExample],
             text, dt = generate_greedy(model, tok, ctx, ex.prompt_ids, max_new_tokens, device, frozen_prefix=(not dense))
             rec["generated"] = text; rec["exact_set"] = exact_set_accuracy(text, ex.outputs)
             rec["ruler_recall"] = ruler_recall_score(text, ex.outputs); rec["decode_seconds"] = dt
+            from .blockgold import list_errors
+            rec["list_errors"] = list_errors(text, ex.outputs)                       # repeated / omitted / extra items (2026-09-22)
+            rec["task"] = (ex.meta or {}).get("task", "niah"); rec["Q"] = len(getattr(ex, "query_keys", []) or [1])
         rows.append(rec)
     return rows
 
@@ -613,6 +616,16 @@ def quick_eval_factory(examples_ruler: list, examples_qa: list, tok, l_star: int
             by_m = {}
             for r in gen: by_m.setdefault(int(r["m"]), []).append(r["ruler_recall"])
             res["ruler_recall_by_m"] = {str(k): float(np.mean(v)) for k, v in sorted(by_m.items())}
+            # the list errors softmax makes on long lists -- the headroom exclusion could claim (owner's B0 gate, 2026-09-22)
+            le = [r["list_errors"] for r in gen if "list_errors" in r]
+            if le:
+                res["list_repeated"] = float(np.mean([x["repeated"] for x in le])); res["list_omitted"] = float(np.mean([x["omitted"] for x in le]))
+                res["list_extra"] = float(np.mean([x["extra"] for x in le])); res["list_exact"] = float(np.mean([x["exact"] for x in le]))
+                by_task = {}
+                for r in gen:
+                    if "list_errors" in r: by_task.setdefault(f"{r['task']}_m{int(r['m'])}", []).append(r["list_errors"])
+                res["list_errors_by"] = {k: dict(n=len(v), repeated=float(np.mean([x["repeated"] for x in v])), omitted=float(np.mean([x["omitted"] for x in v])),
+                                                  extra=float(np.mean([x["extra"] for x in v])), exact=float(np.mean([x["exact"] for x in v]))) for k, v in sorted(by_task.items())}
         # the relation at the answer rows of (l*, h*): does it CONTAIN the gold keys, how large is it, how much mass does it
         # carry.  The 2026-09 grid had recall 0.000, size ~2 and mass ~1e-9 from its first quick eval, and nothing read it
         # (row_precision read 0.9+ there: precision is 1 on an empty support).  train()'s relation-recall gate reads this.

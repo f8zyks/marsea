@@ -93,3 +93,56 @@ def test_gold_by_head_reports_every_head_and_agrees_with_the_single_head_monitor
         else:
             assert math.isnan(x["src_zero_column"])
 
+
+
+@pytest.mark.parametrize("triggered", [False, True])
+def test_block_metrics_partition_the_row_and_agree_with_the_monitor(triggered):
+    """owner's decision (2026-09-22): the gold is a partition.  own + other + rest = the row's mass; the own-block softmax mass
+    at (l, h) equals the single-head monitor's copy-source-block reading; a row-less block is 'other', never 'own'."""
+    from marsea.blockgold import block_metrics, block_metrics_example, ruler_blocks, format_blocks, list_errors
+    model, ctx = _tiny_model(); ctx.triggered = triggered
+    ex = _example(); ex.value_owner = [0, 0]; ex.meta = {}
+    bl = ruler_blocks(ex)
+    assert [b["spans"] for b in bl] == [[(5, 8)], [(12, 15)]] and [b["rows"] for b in bl] == [[29, 30, 31], [32, 33, 34]]
+    res = block_metrics(model, ctx, [ex, ex], [1, 2], device="cpu")
+    assert res["n_rows"] == 12 and set(res["layers"]) == {"1", "2"}
+    r = res["layers"]["2"]
+    for h in range(8):
+        tot = r["mass_own_sm"][h] + r["mass_other_sm"][h] + r["mass_rest_sm"][h]
+        assert abs(tot - 1.0) < 1e-6                                              # the three regions partition the visible row
+        assert r["mass_own_final"][h] + r["mass_other_final"][h] + r["mass_rest_final"][h] <= 1.0 + 1e-6   # final: the tau_i discount may lose mass
+        assert 0 <= r["block_precision_rel"][h] <= 1 and 0 <= r["block_recall"][h] <= 1
+        assert abs(r["mass_stale_final"][h] + r["mass_remaining_final"][h] - r["mass_other_final"][h]) < 1e-9   # other = stale + remaining
+    # value 1's rows come after value 0's: from their side value 0 is STALE, never remaining
+    o = block_metrics_example(model, ctx, ex, [2], device="cpu")[2]
+    assert float(o["mass_remaining_sm"].sum()) > 0 and float(o["mass_stale_sm"].sum()) > 0
+    # a row-less block is 'other'
+    ex2 = _example(); ex2.value_owner = [0, 0]; ex2.meta = dict(task="variable_tracking", chains=[dict(value="1", vars=["Z"], queried=False)], var_mentions={"Z": [(20, 22)]})
+    bl2 = ruler_blocks(ex2); assert bl2[-1]["rows"] == [] and bl2[-1]["spans"] == [(20, 22)]
+    o2 = block_metrics_example(model, ctx, ex2, [2], device="cpu", blocks=bl2)[2]
+    assert float(o2["mass_other_sm"].sum()) > float(o["mass_other_sm"].sum()) - 1e-12
+    assert "col purity" in format_blocks(0, res) and format_blocks(0, res).count("\n") == 8
+    # B0 has no relation: relation columns are None, masses still there
+    e = list_errors(" 111, 222, 222, 999 mentioned", ["111", "222", "333"])
+    assert abs(e.pop("recall") - 2 / 3) < 1e-12 and e == dict(n_listed=4, n_gold=3, repeated=1, omitted=1, extra=1, exact=False)
+    assert list_errors(" 333, 111, 222", ["111", "222", "333"])["exact"]
+
+
+def test_qa_blocks_own_the_supporting_facts_and_distractors_are_row_less():
+    """QA block gold (2026-09-22): the answer rows own the supporting sentences (Hotpot) / paragraphs (MuSiQue); every
+    distractor passage is a row-less block, so its mass reads as 'other'."""
+    from marsea.blockgold import qa_blocks, block_metrics
+    from marsea.data.qa import QAExample
+    model, ctx = _tiny_model()
+    ex = QAExample(prompt="", gold="", answer="x", question="q", passages=[("t0", "", False), ("t1", "", True), ("t2", "", False), ("t3", "", True)],
+                   gold_slots=[1, 3], m=2, prompt_ids=list(range(40)), gold_ids=[5, 6, 7],
+                   passage_spans=[(0, 10), (10, 20), (20, 30), (30, 38)], sentence_spans=[(1, 0, (12, 15)), (3, 1, (33, 36))], answer_rows=[39, 40, 41])
+    bl = qa_blocks(ex)
+    assert bl[0]["rows"] == [39, 40, 41] and bl[0]["spans"] == [(12, 15), (33, 36)]
+    assert [(b["name"], b["rows"], b["spans"]) for b in bl[1:]] == [("passage0", [], [(0, 10)]), ("passage2", [], [(20, 30)])]
+    ex.sentence_spans = []                                                     # MuSiQue: paragraph-level gold
+    assert qa_blocks(ex)[0]["spans"] == [(10, 20), (30, 38)]
+    res = block_metrics(model, ctx, [ex], [1, 2], device="cpu")
+    r = res["layers"]["2"]
+    assert res["n_rows"] == 3 and all(r["mass_stale_sm"][h] == 0 and r["mass_remaining_sm"][h] == 0 for h in range(8))   # one owner: nothing stale
+    assert all(abs(r["mass_own_sm"][h] + r["mass_other_sm"][h] + r["mass_rest_sm"][h] - 1) < 1e-6 for h in range(8))

@@ -39,6 +39,7 @@ def main():
     ap.add_argument("--module_warmup_steps", type=int, default=0)
     ap.add_argument("--monitor_every", type=int, default=0, help="the relation monitor every N Phase-B steps (needs --eval_ruler)")
     ap.add_argument("--monitor_n", type=int, default=2, help="examples per --eval_ruler file the monitor reads")
+    ap.add_argument("--quick_gen_n", type=int, default=50, help="examples the quick eval GENERATES on (spread over the eval files)")
     ap.add_argument("--triggered", action="store_true", help="train the TRIGGERED teacher-forced form (= prefill + decode; marsea/triggered.py); needs --mode dense")
     ap.add_argument("--gate_min_relation_recall", type=float, default=0.0); ap.add_argument("--gate_after", type=int, default=250)
     ap.add_argument("--phase_a_unpatched", action="store_true",
@@ -78,7 +79,7 @@ def main():
         if not eval_files:
             raise FileNotFoundError(f"--eval_ruler {args.eval_ruler} matches no file")
         exs = [build_example(r, tok) for f in eval_files for r in load_jsonl(f)]
-        quick = quick_eval_factory(exs, [], tok, l_star, h_star, args.arm)
+        quick = quick_eval_factory(exs, [], tok, l_star, h_star, args.arm, n_gen=args.quick_gen_n)
         if args.monitor_every:
             from marsea.monitor import monitor_factory
             mon = [build_example(r, tok) for f in eval_files for r in load_jsonl(f)[:args.monitor_n]]

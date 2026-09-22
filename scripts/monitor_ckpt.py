@@ -24,6 +24,8 @@ def main():
             recs += monitor_example(model, ctx, ex, det["l_star"], det["h_star"])
         res[ck] = summarise(recs)
         res[ck]["by_head"] = gold_by_head(model, ctx, exs, layers)             # where the gold tokens are, for every head
+        from marsea.blockgold import block_metrics
+        res[ck]["blocks"] = block_metrics(model, ctx, exs, layers)             # the partition view: own / other / stale / rest
         print(ck); print(format_line("-", res[ck]), flush=True)
         del model; torch.cuda.empty_cache()
         if args.out:

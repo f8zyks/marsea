@@ -218,8 +218,12 @@ def monitor_factory(examples: list, l_star: int, h_star: int, device="cuda", lay
         for ex in examples:
             recs += monitor_example(model, ctx, ex, l_star, h_star, device)
         res = summarise(recs)
+        if not recs:
+            res = dict(n=0)
         if layers:
             res["by_head"] = gold_by_head(model, ctx, examples, list(layers), device)
+            from .blockgold import block_metrics
+            res["blocks"] = block_metrics(model, ctx, examples, list(layers), device)      # the partition view (2026-09-22)
         return res
     return monitor
 
@@ -227,7 +231,11 @@ def monitor_factory(examples: list, l_star: int, h_star: int, device="cuda", lay
 def format_line(step, res: dict) -> str:
     """one readable line per monitor call (the full dict goes to train_log.jsonl)."""
     if not res or not res.get("n", 1) or "all" not in res:
-        return f"[monitor] step {step}: no rows"
+        line = f"[monitor] step {step}: no rows"                                  # a baseline without a relation (B0) has no
+        if res and res.get("blocks"):                                             # single-head rows; its block masses still print
+            from .blockgold import format_blocks
+            line += "\n" + format_blocks(step, res["blocks"])
+        return line
     f = lambda v, nd=3: "-" if v is None else f"{v:.{nd}f}"
     parts = []
     for name, a in [("all", res["all"]), ("first tok", res["first_token"])] + [(f"m={m}", a) for m, a in res["by_m"].items()]:
@@ -239,4 +247,7 @@ def format_line(step, res: dict) -> str:
     line = f"[monitor] step {step}  " + "  ||  ".join(parts) + tail
     if res.get("by_head"):
         line += "\n" + format_heads(step, res["by_head"])
+    if res.get("blocks"):
+        from .blockgold import format_blocks
+        line += "\n" + format_blocks(step, res["blocks"])
     return line
