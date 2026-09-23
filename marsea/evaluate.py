@@ -643,12 +643,16 @@ def quick_eval_factory(examples_ruler: list, examples_qa: list, tok, l_star: int
         # the relation at the answer rows of (l*, h*): does it CONTAIN the gold keys, how large is it, how much mass does it
         # carry.  The 2026-09 grid had recall 0.000, size ~2 and mass ~1e-9 from its first quick eval, and nothing read it
         # (row_precision read 0.9+ there: precision is 1 on an empty support).  train()'s relation-recall gate reads this.
-        rr = [r_ for r in rows for r_ in ((r.get("attention") or {}).get("rows") or []) if "rel_recall" in r_]
+        # B4's rows carry rel_recall (its sparsemax support plays the relation's part) but not Rtil / supp_rel: every B4 run
+        # died here at its first quick eval (KeyError, 2026-09-23) -- read what a row has
+        rr = [r_ for r in rows for r_ in ((r.get("attention") or {}).get("rows") or []) if "rel_recall" in r_ and "E_size" in r_]
         if rr:
             res["relation_recall_row"] = float(np.nanmean([x["rel_recall"] for x in rr]))
             res["relation_size_row"] = float(np.mean([x["E_size"] for x in rr]))
-            res["relation_mass_row"] = float(np.mean([x["Rtil"] for x in rr]))
-            res["relation_support_nonempty"] = float(np.mean([x["supp_rel"] > 0 for x in rr]))
+            if all("Rtil" in x for x in rr):
+                res["relation_mass_row"] = float(np.mean([x["Rtil"] for x in rr]))
+            if all("supp_rel" in x for x in rr):
+                res["relation_support_nonempty"] = float(np.mean([x["supp_rel"] > 0 for x in rr]))
         if examples_qa:
             q = evaluate_qa(model, tok, ctx, examples_qa, l_star, h_star, arm, modes=("teacher",), device=device)
             res["qa_tf_loss"] = float(np.mean([r["tf_loss"] for r in q]))
