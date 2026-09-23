@@ -90,11 +90,11 @@ class MESHNorm(nn.Module):                                             # B2
     """
 
     def __init__(self, d_head: int, hidden: int = 64, eps: float = 1.0, lam: float = 1.0, mesh_steps: int = 4,
-                 inner_iters: int = 5, outer_iters: int = 20, noise: float = 1e-6, causal: bool = False, causal_iters: int = 3):
+                 inner_iters: int = 5, outer_iters: int = 20, noise: float = 1e-6, causal: bool = False, causal_iters: int = 1):
         super().__init__()
         # causal (2026-09-23): the prompt is ONE Sinkhorn block (= the generation prefill); every answer row t gets its own
-        # Sinkhorn over rows <= t, warm-started from row t - 1's duals (causal_iters iterations, no MESH sharpening steps
-        # on the per-row solves), and only row t is emitted -- so teacher forcing IS decoding, and no row sees a later
+        # Sinkhorn over rows <= t, warm-started from row t - 1's duals (causal_iters sweeps, default 1, no MESH sharpening
+        # steps on the per-row solves), and only row t is emitted -- so teacher forcing IS decoding, and no row sees a later
         # one.  The gradient of a per-row solve flows through row t's own scaling (the inherited duals are constants);
         # the prompt block's gradient is the stock one.  Stock MESH normalises the whole teacher-forced matrix at once:
         # a row's column scaling then depends on LATER rows (the gold answer), which decoding never has (2026-09-20).
@@ -132,9 +132,17 @@ class MESHNorm(nn.Module):                                             # B2
             S32 = _fp(S).masked_fill(~vis, float("-inf"))
             f, gd = d_p.extra["dual_f"], d_p.extra["dual_g"]                  # [B,H,n_p], [B,H,n_p]: the prompt block's duals
             la, lb = self._heads(K_kv, Q)
+            # hoisted out of the row loop: the gradient-free cost matrix of the whole sequence and the 1-D visibilities.
+            # A FULL re-solve per row (the prompt rows' duals move too) is what MESH's retrieval needs: sealing the prompt's
+            # duals leaves every key claimed by the prompt rows and the answer row cannot take its copy source (loss 2.2
+            # against 0.36 at init, 2026-09-23).  It costs O(n^2) per row; causal_iters = 1 keeps it at ~2x stock MESH.
+            with torch.no_grad():
+                negC_full = (S32.detach() / self.eps).masked_fill(~torch.isfinite(S32), 0.0)
+                key_vis_full = vis.any(-2); row_vis_full = vis.any(-1)                # [B,H,n]
             rows = []
             for t in range(n_p, n_q):
-                A_t, f, gd = self._row_solve(S32[:, :, :t + 1, :t + 1], vis[:, :, :t + 1, :t + 1], la[..., :t + 1], lb[..., :t + 1], f, gd)
+                A_t, f, gd = self._row_solve(S32[:, :, t:t + 1, :t + 1], negC_full[:, :, :t + 1, :t + 1],
+                                             key_vis_full[..., :t + 1], row_vis_full[..., :t + 1], la[..., :t + 1], lb[..., :t + 1], f, gd)
                 rows.append(torch.nn.functional.pad(A_t, (0, n_k - t - 1)))
             A_a = torch.cat(rows, -2)                                          # [B,H,m,n_k]
             pad = torch.zeros(B, H, n_p, n_q - n_p, dtype=A_p.dtype, device=S.device)
@@ -143,35 +151,35 @@ class MESHNorm(nn.Module):                                             # B2
                                                   "dual_f": f.detach(), "dual_g": gd.detach()})
         return A.to(S.dtype), diag
 
-    def _row_solve(self, S32, vis, la, lb_all, f_prev, gd_prev):
-        """row t = the last row of S32 [B,H,t+1,t+1]: Sinkhorn over rows <= t warm-started from (f_prev, gd_prev) [B,H,t],
-        causal_iters iterations, no MESH steps; la / lb_all the marginal heads on keys / rows <= t.  Returns
+    def _row_solve(self, s_t, negC, key_vis, row_vis, la, lb_all, f_prev, gd_prev):
+        """row t: s_t [B,H,1,t+1] its scores (with grad); negC [B,H,t+1,t+1] the gradient-free cost matrix of rows <= t
+        (0 off vis); key_vis / row_vis [B,H,t+1]; la / lb_all the marginal heads on keys / rows <= t.  A Sinkhorn over
+        rows <= t warm-started from (f_prev, gd_prev) [B,H,t], causal_iters iterations, no MESH steps.  Returns
         (A_t [B,H,1,t+1], f [B,H,t+1], gd [B,H,t+1]).  The inherited duals are constants for the gradient; row t's own
-        scaling carries it."""
-        key_vis = vis.any(-2); row_vis = vis.any(-1)
+        scaling carries it.  Dead pairs (a padding row or key) stay out through the -inf marginals."""
         log_a, log_b = self._marginals(la, lb_all, key_vis, row_vis)
-        negC = (S32 / self.eps)                                                # -C / eps, -inf off vis
         key_ok = torch.isfinite(log_a); row_ok = torch.isfinite(log_b)
-        dead = (~row_ok).unsqueeze(-1) | (~key_ok).unsqueeze(-2)
-        negC_safe = negC.masked_fill(dead | ~torch.isfinite(negC), 0.0)
-        la = log_a.masked_fill(~key_ok, 0.0); lb = log_b.masked_fill(~row_ok, 0.0)
-        zero1 = torch.zeros_like(la[..., :1])
+        la_s = log_a.masked_fill(~key_ok, 0.0); lb_s = log_b.masked_fill(~row_ok, 0.0)
+        zero1 = torch.zeros_like(la_s[..., :1])
         f = torch.cat([f_prev.detach(), zero1], -1); gd = torch.cat([gd_prev.detach(), zero1], -1)
+        # the Sinkhorn iterations over the whole prefix carry NO gradient (and no [t, t] tensor survives the row):
+        # 300 answer rows x a 0.5 GB slice with grad each was 100 GB (2026-09-23)
         with torch.no_grad():
+            la_c, lb_c = la_s.detach(), lb_s.detach()
             for _ in range(self.causal_iters):
-                gd = (la - torch.logsumexp(negC_safe + f.unsqueeze(-1), dim=-2)).masked_fill(~key_ok, 0.0)
-                f = (lb - torch.logsumexp(negC_safe + gd.unsqueeze(-2), dim=-1)).masked_fill(~row_ok, 0.0)
-        # row t with the gradient: its own row scaling against the (constant) column duals
-        gd_c = gd.detach()
-        row_t = negC_safe[..., -1:, :] + gd_c.unsqueeze(-2)                                   # [B,H,1,t+1]
-        f_t = lb[..., -1:] - torch.logsumexp(row_t, dim=-1)
+                gd = (la_c - torch.logsumexp(negC + f.unsqueeze(-1), dim=-2)).masked_fill(~key_ok, 0.0)
+                f = (lb_c - torch.logsumexp(negC + gd.unsqueeze(-2), dim=-1)).masked_fill(~row_ok, 0.0)
+            dead_t = (~row_ok[..., -1:]).unsqueeze(-1) | (~key_ok).unsqueeze(-2)             # [B,H,1,t+1]
+        # row t with the gradient: its own scores and row scaling against the (constant) column duals
+        row_t = (s_t / self.eps).masked_fill(dead_t | ~torch.isfinite(s_t), 0.0) + gd.unsqueeze(-2)
+        f_t = lb_s[..., -1:] - torch.logsumexp(row_t, dim=-1)
         logP = row_t + f_t.unsqueeze(-1)
-        A_t = torch.exp(logP.masked_fill((dead | ~torch.isfinite(negC))[..., -1:, :], float("-inf")))
+        A_t = torch.exp(logP.masked_fill(dead_t | ~torch.isfinite(s_t), float("-inf")))
         f = torch.cat([f[..., :-1], f_t.detach()], -1)
         return A_t, f, gd
 
     # ---- causal decoding: the prefill's duals and the query history, one step = one warm-started row solve
-    def init_decode(self, diag, Q):
+    def init_decode(self, diag, Q, S32=None, vis=None):
         return dict(f=diag.extra["dual_f"].detach().clone(), g=diag.extra["dual_g"].detach().clone(), Q=Q.detach())
 
     @torch.no_grad()
@@ -184,7 +192,8 @@ class MESHNorm(nn.Module):                                             # B2
         vis = torch.tril(torch.ones(n, n, dtype=torch.bool, device=S32.device)).view(1, 1, n, n).expand(S32.shape[0], S32.shape[1], n, n)
         S32 = S32.masked_fill(~vis, float("-inf"))
         la, lb = self._heads(K_kv, Qh)
-        A_t, f, gd = self._row_solve(S32, vis, la, lb, cache["f"], cache["g"])
+        negC = (S32 / self.eps).masked_fill(~torch.isfinite(S32), 0.0)
+        A_t, f, gd = self._row_solve(S32[..., -1:, :], negC, vis.any(-2), vis.any(-1), la, lb, cache["f"], cache["g"])
         cache["f"], cache["g"] = f, gd
         return A_t
 
@@ -299,7 +308,7 @@ def make_normalizer(arm: str, d_head: int, **kw) -> nn.Module:
     if arm_l == "b1":
         return SoftmaxOneNorm()
     if arm_l == "b2":
-        return MESHNorm(d_head, **{k: v for k, v in kw.items() if k in ("hidden", "eps", "lam", "mesh_steps", "inner_iters", "outer_iters")})
+        return MESHNorm(d_head, **{k: v for k, v in kw.items() if k in ("hidden", "eps", "lam", "mesh_steps", "inner_iters", "outer_iters", "noise", "causal", "causal_iters")})
     if arm_l == "b3":
         return KeyOnlyTauNorm(d_head, **kw)
     if arm_l == "b4":

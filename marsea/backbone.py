@@ -358,7 +358,8 @@ class MarSeaAttention(nn.Module):
                 A, diag = self.normalizer.normalize(S, vis, k, q, state, n_prefill=n_pre)
                 if ctx.generation and n_q == n_k and n_q > 1:
                     if getattr(ctx, "mesh_caches", None) is None: ctx.mesh_caches = {}
-                    ctx.mesh_caches[self.layer_idx] = self.normalizer.init_decode(diag, q)
+                    with torch.autocast(device_type=q.device.type, enabled=False):
+                        ctx.mesh_caches[self.layer_idx] = self.normalizer.init_decode(diag, q, S.float().masked_fill(~vis, float("-inf")), vis)
             elif isinstance(self.normalizer, SoftmaxNorm) or not hasattr(self.normalizer, "tauK"):
                 A, diag = self.normalizer.normalize(S, vis, k, q, state)
             else:

@@ -65,3 +65,9 @@ def test_causal_mesh_teacher_forced_equals_cached_decoding_on_a_model():
             past = o.past_key_values; outs.append(o.logits[0, -1])
         ctx.clear_generation()
     assert float((torch.stack(outs) - full).abs().max()) < 1e-7
+
+
+def test_make_normalizer_passes_causal_to_b2():
+    from marsea.baselines import make_normalizer
+    assert make_normalizer("b2", 8, causal=True, causal_iters=2).causal is True
+    assert make_normalizer("b2", 8).causal is False
