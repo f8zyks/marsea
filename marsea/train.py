@@ -84,6 +84,7 @@ class TrainConfig:
                                                # the answer rows of the relation heads, weight annealed to 0 over aux_anneal_steps
     aux_anneal_steps: int = 1000
     aux_hard_negative_weight: float = 4.0      # the other blocks' spans (stale / remaining values, distractor passages) weigh this much
+    aux_floor: float = 0.2                     # the anneal stops at this fraction of aux_block_weight (owner: the BCE is what holds membership)
     recal_every: int = 0                       # re-bisect b0 (per head when the relation has per-head b0) every N steps
     st_T0: float = 1.0                         # straight-through backward temperature at the start of Phase B ...
     st_anneal_steps: int = 0                   # ... annealed linearly to 1 over this many steps
@@ -413,7 +414,7 @@ def block_bce(lg, T, cand, w_hard, hard_mask):
 def aux_block_loss(model, ctx, seq, cfg: TrainConfig, step: int):
     """the Phase-B auxiliary: relation logits at the sequence's owned answer rows against the block gold, on the relation heads,
     from the (K, Q) the backbone captured during the LM forward (detached: the targets shape the RELATION, not the LoRA)."""
-    w0 = cfg.aux_block_weight * max(0.0, 1.0 - (step - cfg.phase_a_steps) / max(1, cfg.aux_anneal_steps))
+    w0 = cfg.aux_block_weight * max(cfg.aux_floor, 1.0 - (step - cfg.phase_a_steps) / max(1, cfg.aux_anneal_steps))
     if w0 <= 0 or not seq.blocks or not getattr(ctx, "aux_qk", None):
         return None, 0.0
     total = 0.0; n = 0

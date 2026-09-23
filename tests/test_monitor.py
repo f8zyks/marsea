@@ -124,7 +124,7 @@ def test_block_metrics_partition_the_row_and_agree_with_the_monitor(triggered):
     assert "col purity" in format_blocks(0, res) and format_blocks(0, res).count("\n") == 8
     # B0 has no relation: relation columns are None, masses still there
     e = list_errors(" 111, 222, 222, 999 mentioned", ["111", "222", "333"])
-    assert abs(e.pop("recall") - 2 / 3) < 1e-12 and e == dict(n_listed=4, n_gold=3, repeated=1, omitted=1, extra=1, exact=False)
+    assert abs(e.pop("recall") - 2 / 3) < 1e-12 and abs(e.pop("precision") - 2 / 4) < 1e-12 and e == dict(n_listed=4, n_gold=3, repeated=1, omitted=1, extra=1, exact=False)
     assert list_errors(" 333, 111, 222", ["111", "222", "333"])["exact"]
 
 
@@ -172,4 +172,7 @@ def test_aux_block_loss_runs_on_a_tiny_model_and_moves_the_relation():
     loss.backward()
     nm = model.model.layers[1].self_attn.normalizer
     assert float(nm.relation.U.grad.abs().sum()) > 0 if hasattr(nm.relation.U, "grad") else True
-    assert aux_block_loss(model, ctx, seq, cfg, step=100)[0] is None                # annealed to zero
+    l2, w2 = aux_block_loss(model, ctx, seq, cfg, step=100)                            # annealed to the floor, not to zero
+    assert l2 is not None and abs(w2 - 0.2) < 1e-9
+    cfg.aux_floor = 0.0
+    assert aux_block_loss(model, ctx, seq, cfg, step=100)[0] is None

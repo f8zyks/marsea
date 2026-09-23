@@ -37,7 +37,7 @@ def main():
     ap.add_argument("--warmstart_sequences", type=int, default=24, help="sequences the warm start cycles through")
     ap.add_argument("--warmstart_targets", default="attention", choices=["attention", "blocks"], help="the warm start's targets: the model's high-mass pairs, or the BLOCK GOLD")
     ap.add_argument("--aux_block_weight", type=float, default=0.0, help="Phase B: auxiliary BCE of the relation logits against the block gold (annealed to 0)")
-    ap.add_argument("--aux_anneal_steps", type=int, default=1000); ap.add_argument("--aux_hard_negative_weight", type=float, default=4.0)
+    ap.add_argument("--aux_anneal_steps", type=int, default=1000); ap.add_argument("--aux_hard_negative_weight", type=float, default=4.0); ap.add_argument("--aux_floor", type=float, default=0.2)
     ap.add_argument("--warmstart_min_distance", type=int, default=0, help="a warm-start target pair spans at least this many tokens")
     ap.add_argument("--rho0", type=float, default=0.05, help="relation coverage the b0 calibration targets (per head with relation_per_head)")
     ap.add_argument("--recal_every", type=int, default=0, help="re-bisect b0 to rho0 every N Phase-B steps")
@@ -72,7 +72,7 @@ def main():
                       allow_phase_a_layer_change=args.allow_phase_a_layer_change,
                       relation_warmstart_steps=args.relation_warmstart_steps, warmstart_mass=args.warmstart_mass,
                       warmstart_lr=args.warmstart_lr, warmstart_answer_rows_only=args.warmstart_answer_rows_only, warmstart_sequences=args.warmstart_sequences, warmstart_targets=args.warmstart_targets,
-                      aux_block_weight=args.aux_block_weight, aux_anneal_steps=args.aux_anneal_steps, aux_hard_negative_weight=args.aux_hard_negative_weight,
+                      aux_block_weight=args.aux_block_weight, aux_anneal_steps=args.aux_anneal_steps, aux_hard_negative_weight=args.aux_hard_negative_weight, aux_floor=args.aux_floor,
                       warmstart_min_distance=args.warmstart_min_distance, rho0=args.rho0, recal_every=args.recal_every, st_T0=args.st_T0,
                       st_anneal_steps=args.st_anneal_steps, module_warmup_steps=args.module_warmup_steps,
                       gate_min_relation_recall=args.gate_min_relation_recall, gate_after=args.gate_after, triggered=args.triggered, monitor_every=args.monitor_every)

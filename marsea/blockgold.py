@@ -213,5 +213,7 @@ def list_errors(generated: str, outputs: list) -> dict:
         seen.add(it)
     omitted = sum(1 for g in gold if g not in seen)
     extra = sum(1 for it in seen if it not in gs)
+    correct = len(gold) - omitted                                           # distinct gold items listed
     return dict(n_listed=len(items), n_gold=len(gold), repeated=repeated, omitted=omitted, extra=extra,
-                exact=(seen == gs and repeated == 0), recall=1.0 - omitted / max(1, len(gold)))
+                exact=(seen == gs and repeated == 0), recall=1.0 - omitted / max(1, len(gold)),
+                precision=correct / max(1, len(items)))                     # of the items LISTED, the share that are distinct gold items
