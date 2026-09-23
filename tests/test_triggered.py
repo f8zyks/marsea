@@ -527,3 +527,60 @@ def test_relation_from_scores_is_the_rows_top_k_by_attention():
     src = (A * d.E.to(DT)).amax(-1)[:, :, n_p:]                                           # the winner takes most of R + lam T
     assert float(src.min()) > 0.2 and float(src.mean()) > 0.5
 
+
+
+def test_auto_direction_whole_model_qa_column_form_trains_and_decodes_like_teacher_forcing():
+    """the QA column-form pilot's path end to end on a tiny model (2026-09-23): direction "auto" + the anchored relation; a
+    QA sequence (ctx.relation_direction = "column") takes a training forward with the aux capture, the block loss on its
+    supporting-span blocks has a gradient into the relation head, and the same weights decode token by token (the column
+    decode path) to the teacher-forced logits."""
+    from types import SimpleNamespace
+    from marsea.backbone import patch_model, MarSeaContext
+    from marsea.baselines import make_normalizer
+    from marsea.train import aux_block_loss, TrainConfig
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+    torch.manual_seed(0)
+    cfg = Qwen2Config(vocab_size=97, hidden_size=64, intermediate_size=128, num_hidden_layers=3, num_attention_heads=8,
+                      num_key_value_heads=2, max_position_embeddings=512, attn_implementation="eager")
+    model = Qwen2ForCausalLM(cfg).double(); ctx = MarSeaContext(mode="dense")
+    torch.manual_seed(1)
+    patch_model(model, [1, 2], lambda l: make_normalizer("marsea", 8, relation_per_head=8, per_head=8, direction="auto", tau_row=1.0, lam_row=0.0,
+                                                         tau_col=1.0, lam_col=0.0, relation_topk=4, relation_answer_rows_only=True,
+                                                         relation_anchor_scores=True).double(), ctx)
+    model.marsea_ctx = ctx
+    g = torch.Generator().manual_seed(3); prompt = torch.randint(0, 97, (30,), generator=g).tolist(); gold = torch.randint(0, 97, (5,), generator=g).tolist()
+    ids = torch.tensor([prompt + gold]); n_p = len(prompt)
+    rows = [n_p - 1 + t for t in range(len(gold))]
+    blocks = [dict(name="answer", rows=rows, spans=[(4, 9), (17, 21)]), dict(name="passage0", rows=[], spans=[(10, 16)])]
+    seq = SimpleNamespace(input_ids=ids, labels=torch.tensor([[-100] * n_p + gold]), source="hotpot", index=0, n_label_tokens=len(gold), blocks=blocks)
+    # -- the training forward of a QA sequence: column form, aux capture, block loss with a gradient into the relation head
+    model.train(); ctx.triggered = True; ctx.n_prefill = n_p; ctx.relation_direction = "column"
+    ctx.aux_capture = True; ctx.aux_qk = {}
+    out = model(input_ids=ids, use_cache=False)
+    assert all(model.model.layers[l].self_attn.normalizer.active_direction == "column" for l in (1, 2))
+    loss, w = aux_block_loss(model, ctx, seq, TrainConfig(aux_block_weight=1.0, aux_anneal_steps=100, phase_a_steps=0), step=0)
+    assert loss is not None and w == 1.0 and torch.isfinite(loss)
+    (out.logits[0, n_p - 1:-1].log_softmax(-1).gather(-1, torch.tensor(gold).view(-1, 1)).mean().neg() + loss).backward()
+    nm = model.model.layers[1].self_attn.normalizer
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in nm.relation.parameters())
+    assert sum(float(p.grad.abs().sum()) for n_, p in nm.relation.named_parameters() if n_.startswith(("U", "V"))) > 0
+    model.zero_grad(); ctx.aux_capture = False; ctx.aux_qk = None
+    # -- teacher forcing == cached decoding through the column decode path, on the same weights
+    model.eval()
+    with torch.no_grad():
+        full = model(input_ids=ids, use_cache=False).logits[0, n_p - 1:-1]
+    ctx.n_prefill = None
+    outs = []
+    with torch.no_grad():
+        ctx.generation = True; ctx.decode_caches = {}
+        pre = model(input_ids=ids[:, :n_p], use_cache=True); past = pre.past_key_values; outs.append(pre.logits[0, -1])
+        for t in range(len(gold) - 1):
+            o = model(input_ids=ids[:, n_p + t: n_p + t + 1], past_key_values=past, use_cache=True)
+            past = o.past_key_values; outs.append(o.logits[0, -1])
+        ctx.generation = False; ctx.decode_caches = {}
+    assert float((torch.stack(outs) - full).abs().max()) < 1e-7
+    # -- and the same model, told the next sequence is RULER, runs the row form
+    ctx.relation_direction = "row"; ctx.n_prefill = n_p
+    with torch.no_grad():
+        model(input_ids=ids, use_cache=False)
+    assert all(model.model.layers[l].self_attn.normalizer.active_direction == "row" for l in (1, 2))
