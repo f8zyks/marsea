@@ -65,7 +65,7 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
         S32 = _fp(S).masked_fill(~visb, float("-inf"))
         dt, dev = S32.dtype, S.device
         S_a = S32[:, :, n_p:, :]; vis_a = visb[:, :, n_p:, :]                       # [B,H,m,n]
-        A_sm_a = row_softmax(S_a, vis_a)
+        A_sm_a = norm.base_softmax(S_a, vis_a)
         if logits_override is not None:
             logits_a = _fp(logits_override[..., n_p:, :] if full_lo else logits_override).expand(B, H, m, n_k)
         else:

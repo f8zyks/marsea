@@ -584,3 +584,66 @@ def test_auto_direction_whole_model_qa_column_form_trains_and_decodes_like_teach
     with torch.no_grad():
         model(input_ids=ids, use_cache=False)
     assert all(model.model.layers[l].self_attn.normalizer.active_direction == "row" for l in (1, 2))
+
+
+# --------------------------------------------------------------------------- MarSea on a softmax-one base (owner, 2026-09-23)
+def test_softmax_one_base_row_form_masses_and_decoding():
+    """base="softmax_one": step 1 is exp(s) / (1 + sum exp).  Off E and with E empty the row IS softmax-one (B1); on E the
+    relation carries R_i (+ lam T_i) of THAT base; rows sum to R_i + T_i < 1; the row form stays row-local (TF == decoding)."""
+    from marsea.baselines import SoftmaxOneNorm
+    norm, Q, K_kv, S, vis, n_p = _setup(rho=0.4, direction="row", tau_row=1.0, lam_row=0.25, relation_topk=4, relation_answer_rows_only=True,
+                                        base="softmax_one")
+    with torch.no_grad():
+        A, d = norm.normalize(S, vis, K_kv, Q, State(), n_prefill=n_p)
+        A_p, A_dec = _by_decoding(norm, Q, K_kv, S, vis, n_p, 64)
+        A_b1, _ = SoftmaxOneNorm().normalize(S, vis)
+    visb = vis.expand_as(d.E)
+    assert torch.equal(d.A_sm, A_b1.to(d.A_sm.dtype)) or float((d.A_sm - A_b1).abs().max()) < 1e-12   # step 1 IS B1
+    assert float(A.sum(-1).max()) < 1.0                                                     # every row attends partly to nothing
+    has = d.E.any(-1)
+    assert float((A.sum(-1) - d.A_sm.sum(-1))[has].abs().max()) < 1e-9                       # ...and keeps softmax-one's total: R + T
+    assert torch.equal(A[:, :, :n_p], A_b1[:, :, :n_p].to(A.dtype))                          # prompt rows: no relation -> B1 exactly
+    off = ~d.E & visb & has.unsqueeze(-1)
+    assert float((A[off] - (1 - 0.25) * d.A_sm[off]).abs().max()) < 1e-12                    # tail scaled by 1 - lam
+    R = (d.A_sm * d.E.to(DT)).sum(-1); T = (d.A_sm * (~d.E & visb).to(DT)).sum(-1)
+    assert float(((A * d.E.to(DT)).sum(-1) - (R + 0.25 * T))[has].abs().max()) < 1e-9        # the relation holds R + lam T of the base
+    assert float((A_dec - A[:, :, n_p:]).abs().max()) < 1e-9                                 # row-local: decoding == teacher forcing
+
+
+def test_softmax_one_base_whole_model_teacher_forced_equals_cached_decoding():
+    from marsea.backbone import patch_model, MarSeaContext
+    from marsea.baselines import make_normalizer
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+    torch.manual_seed(0)
+    cfg = Qwen2Config(vocab_size=97, hidden_size=64, intermediate_size=128, num_hidden_layers=3, num_attention_heads=8,
+                      num_key_value_heads=2, max_position_embeddings=512, attn_implementation="eager")
+    model = Qwen2ForCausalLM(cfg).double(); ctx = MarSeaContext(mode="dense")
+    torch.manual_seed(1)
+    patch_model(model, [1, 2], lambda l: make_normalizer("marsea", 8, relation_per_head=8, per_head=8, direction="row", tau_row=1.0, lam_row=0.0,
+                                                         relation_topk=8, relation_answer_rows_only=True, relation_anchor_scores=True,
+                                                         base="softmax_one").double(), ctx)
+    model.eval(); ctx.triggered = True
+    g = torch.Generator().manual_seed(3); prompt = torch.randint(0, 97, (30,), generator=g).tolist(); gold = torch.randint(0, 97, (6,), generator=g).tolist()
+    ids = torch.tensor([prompt + gold]); ctx.n_prefill = len(prompt)
+    with torch.no_grad():
+        full = model(input_ids=ids, use_cache=False).logits[0, len(prompt) - 1:-1]
+    ctx.n_prefill = None; outs = []
+    with torch.no_grad():
+        ctx.generation = True; ctx.decode_caches = {}
+        pre = model(input_ids=ids[:, :len(prompt)], use_cache=True); past = pre.past_key_values; outs.append(pre.logits[0, -1])
+        for t in range(len(gold) - 1):
+            o = model(input_ids=ids[:, len(prompt) + t: len(prompt) + t + 1], past_key_values=past, use_cache=True)
+            past = o.past_key_values; outs.append(o.logits[0, -1])
+        ctx.generation = False; ctx.decode_caches = {}
+    assert float((torch.stack(outs) - full).abs().max()) < 1e-7
+    # with the relation forced empty the whole model IS the B1 arm
+    from marsea.baselines import SoftmaxOneNorm
+    ctx.force_empty = True; ctx.n_prefill = len(prompt)
+    with torch.no_grad():
+        off = model(input_ids=ids, use_cache=False).logits
+    ctx.force_empty = False
+    model_b1 = Qwen2ForCausalLM(cfg).double(); model_b1.load_state_dict({k: v for k, v in model.state_dict().items() if "normalizer" not in k}, strict=False)
+    ctx_b1 = MarSeaContext(mode="dense"); patch_model(model_b1, [1, 2], lambda l: SoftmaxOneNorm().double(), ctx_b1); model_b1.eval()
+    with torch.no_grad():
+        b1 = model_b1(input_ids=ids, use_cache=False).logits
+    assert float((off - b1).abs().max()) < 1e-9

@@ -205,6 +205,15 @@ def row_softmax(S: torch.Tensor, vis: torch.Tensor) -> torch.Tensor:
     return torch.where(anyv, A, torch.zeros_like(A))
 
 
+def row_softmax_one(S: torch.Tensor, vis: torch.Tensor) -> torch.Tensor:
+    """softmax-one (Miller 2023; B1's normaliser) as MarSea's step-1 base (owner, 2026-09-23): exp(s) / (1 + sum_visible
+    exp(s)) -- a phantom key at logit 0 with a zero value vector.  Rows sum to < 1; the phantom's mass 1 - R_i - T_i is
+    attended to nothing.  Same fp32 / exact-zero conventions as row_softmax; the same formula as baselines.SoftmaxOneNorm."""
+    S32 = _fp(S).masked_fill(~vis.bool(), float("-inf"))
+    lse = torch.logsumexp(torch.cat([S32, torch.zeros_like(S32[..., :1])], dim=-1), dim=-1, keepdim=True)
+    return torch.exp(S32 - lse)
+
+
 def broadcast_vis(vis: torch.Tensor, S) -> torch.Tensor:
     """`S` may be a tensor or just its shape -- only the rank and the shape are read, and callers that have no such
     tensor should not have to allocate one (a [B,H,T,T] bool is 805 MB at 8K and 3.2 GB at 16K)."""
@@ -297,7 +306,7 @@ class MarSeaNormalizer(nn.Module):
                  tail_share_min: float = 0.0, relation_heads: Optional[list] = None, relation_topk: int = 0,
                  relation_answer_rows_only: bool = False, direction: Optional[str] = None, tau_row: float = 2.0,
                  lam_row: float = 0.0, tau_col: float = 2.0, lam_col: float = 0.0, relation_from_scores: bool = False,
-                 relation_anchor_scores: bool = False, anchor_init_scale: float = 0.1):
+                 relation_anchor_scores: bool = False, anchor_init_scale: float = 0.1, base: str = "softmax"):
         super().__init__()
         assert quota_mode in ("inherited", "uniform")
         assert gate in ("st", "hard_concrete")
@@ -375,6 +384,12 @@ class MarSeaNormalizer(nn.Module):
                 for name_, p_ in self.relation.named_parameters():
                     if name_.startswith("U") or name_.startswith("V"):
                         p_.mul_(float(anchor_init_scale))
+        # base (owner, 2026-09-23): the step-1 row normalisation that defines R_i and T_i -- "softmax" (the spec) or
+        # "softmax_one" (B1's exp(s) / (1 + sum exp): the row may attend to nothing; R_i + T_i < 1).  Everything after
+        # step 1 is unchanged, so the row form stays row-local (teacher forcing == decoding) under either base.
+        assert base in ("softmax", "softmax_one"), base
+        assert base == "softmax" or direction in ("row", "column", "auto"), "softmax_one is a v3 (one-end form) base"
+        self.base = base
         assert direction in (None, "row", "column", "auto")
         self.direction = direction
         self.active_direction = direction if direction in ("row", "column") else None
@@ -392,6 +407,10 @@ class MarSeaNormalizer(nn.Module):
         if tau_j_global:
             from .heads import inv_softplus
             self.tau_j_raw = nn.Parameter(torch.tensor(inv_softplus(1.0 - tau_min)))
+
+    def base_softmax(self, S32: torch.Tensor, vis: torch.Tensor) -> torch.Tensor:
+        """step 1: the row normalisation the forms build on (see `base` in __init__)."""
+        return row_softmax_one(S32, vis) if getattr(self, "base", "softmax") == "softmax_one" else row_softmax(S32, vis)
 
     # ------------------------------------------------------------------ the normaliser
     def normalize(self, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Tensor, Q: torch.Tensor,
@@ -557,8 +576,8 @@ class MarSeaNormalizer(nn.Module):
         g_kv = H // K_kv.shape[1]
         with torch.autocast(device_type=S.device.type, enabled=False):
             S32 = _fp(S).masked_fill(~vis, float("-inf"))
-            # ---- the ONLY normalisation: standard attention (record Sec. 38.1, 41)
-            A_sm = row_softmax(S32, vis)                                     # fp32, exact 0 off vis
+            # ---- the ONLY normalisation: standard attention (record Sec. 38.1, 41), or softmax-one (`base`)
+            A_sm = self.base_softmax(S32, vis)                               # fp32, exact 0 off vis
             c = A_sm.sum(-2)                                                 # [B,H,n_k]  (SAN-1 makes sum_j c_j = n_real)
             # ---- the relation (Sec. 4)
             if logits_override is not None:

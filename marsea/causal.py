@@ -254,7 +254,7 @@ def decode_step(norm: MarSeaNormalizer, cache: FrozenPrefixCache, S_row: torch.T
                     tau_j=torch.ones(B, H, n_k, dtype=A_row.dtype, device=A_row.device), nu=cache.nu)
         return A_row, info
     S32 = _fp(S_row).masked_fill(~vis, float("-inf"))
-    A_sm = row_softmax(S32, vis)                                                 # [B,H,1,n_k]
+    A_sm = norm.base_softmax(S32, vis)                                           # [B,H,1,n_k]
     logits = norm.relation_logits(K_kv, q_t, _fp(S_row), vis, row_offset=t) if logits_row is None else _fp(logits_row)
     E_row, _ = norm.select_E(logits, vis, 0, first_row=t, n_prefill=cache.n_prefill)   # pairwise: no past row changes
     # ---- the new token's own key: seal tau_j now (its visible column is {t}); cbar_j = A_sm[t,t] if E[t,t]
@@ -379,7 +379,7 @@ def reseal_at_boundary(norm: MarSeaNormalizer, cache: FrozenPrefixCache, K_kv: t
     cache.tau_j = tau
     logits = norm.relation(K_kv, Q, key_offset=0, n_k_total=n_k)
     E, _ = norm.select_E(logits, vis, 0, first_row=0, n_prefill=cache.n_prefill)   # a reseal over the rows so far
-    A_sm = row_softmax(S32, vis)
+    A_sm = norm.base_softmax(S32, vis)
     cache.cbar_j = (A_sm * E.to(A_sm.dtype)).sum(-2)
     K = cache.K_ret
     Srel = S32.masked_fill(~E, NEG_PAD).transpose(-1, -2)
