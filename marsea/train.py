@@ -573,6 +573,16 @@ def phase_b_init(model, ctx: MarSeaContext, data, cursor: int, cfg: TrainConfig,
     # sanity 5(a), first half: the SoftmaxNorm (Phase-A) path on the calibration batch
     ctx.phase_a = True; ctx.force_empty = False
     loss_pa = sum(_answer_loss(model, s, cfg.device) for s in seqs) / max(1, ntok)
+    # a softmax-one base (owner, 2026-09-23): E forced empty is then the B1 arm, not softmax, so 5(a)'s reference is the
+    # Phase-A path with softmax-one in the patched layers (loss_pa itself stays the recorded softmax reference)
+    loss_ref = loss_pa
+    if any(getattr(nm, "base", "softmax") == "softmax_one" for nm in norms.values()):
+        from .baselines import SoftmaxOneNorm
+        attns = [m for m in model.modules() if hasattr(m, "softmax_norm") and hasattr(m, "normalizer")]
+        saved = [(m, m.softmax_norm) for m in attns]
+        for m in attns: m.softmax_norm = SoftmaxOneNorm()
+        loss_ref = sum(_answer_loss(model, s, cfg.device) for s in seqs) / max(1, ntok)
+        for m, sn in saved: m.softmax_norm = sn
     raw_vals = {l: [] for l in norms}; stds = {l: [] for l in norms}; head_vals = {l: None for l in norms}
     ctx.phase_a = False; ctx.force_empty = True; ctx.capture_inputs = True; ctx.collect = False
     loss_a = 0.0; ntok = 0
@@ -633,7 +643,7 @@ def phase_b_init(model, ctx: MarSeaContext, data, cursor: int, cfg: TrainConfig,
             if e8 and "rho" in e8: cov[l].append(e8["rho"])
     loss_live /= max(1, ntok)
     ctx.collect = False
-    sanity = dict(loss_phaseA=loss_pa, loss_forced_empty=loss_a, gap_5a=abs(loss_a - loss_pa),
+    sanity = dict(loss_phaseA=loss_pa, loss_base_reference=loss_ref, loss_forced_empty=loss_a, gap_5a=abs(loss_a - loss_ref),
                   loss_live=loss_live, rel_gap_5b=abs(loss_live - loss_a) / max(1e-8, abs(loss_a)),
                   signed_rel_gap_5b=(loss_live - loss_a) / max(1e-8, abs(loss_a)),     # negative: the live relation LOWERS the loss
                   finite=math.isfinite(loss_live), coverage_live={l: float(np.mean(v)) if v else None for l, v in cov.items()})
@@ -642,8 +652,8 @@ def phase_b_init(model, ctx: MarSeaContext, data, cursor: int, cfg: TrainConfig,
         readme["phase_b_init"]["relation_warmstart"] = warm
     print(f"[phase B init] calibration {json.dumps(calib)}\n[phase B init] sanity {json.dumps(sanity)}")
     ctx.mode = mode_saved
-    if sanity["gap_5a"] > 1e-4 * max(1.0, abs(loss_pa)):                     # 5(a): E forced empty == Phase A's path (INV-9 at model level)
-        raise RuntimeError(f"Phase-B init sanity 5(a) failed: forced-empty loss {loss_a} vs Phase-A path {loss_pa}")
+    if sanity["gap_5a"] > 1e-4 * max(1.0, abs(loss_ref)):                    # 5(a): E forced empty == the base's path (INV-9 at model level)
+        raise RuntimeError(f"Phase-B init sanity 5(a) failed: forced-empty loss {loss_a} vs base path {loss_ref} (Phase-A softmax {loss_pa})")
     verdict = init_gap_verdict(sanity, cfg.init_gap_policy)                  # 5(b): live within 5 %, no NaN
     if verdict == "recorded":
         ev = dict(step=cfg.phase_a_steps, event="init sanity 5(b) exceeded; continued by the owner's decision (init_gap_policy=record)",
