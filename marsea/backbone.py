@@ -108,6 +108,7 @@ class MarSeaContext:
     nu: dict = field(default_factory=dict)         # layer_idx -> nu tensor (graph-connected)
     diags: dict = field(default_factory=dict)      # layer_idx -> Diagnostics (detached)
     decode_caches: dict = field(default_factory=dict)
+    mesh_caches: dict = field(default_factory=dict)         # causal MESH (B2): per layer, the prefill's duals + the query history
     patched_layers: list = field(default_factory=list)
     n_forward: int = 0
     last_S: dict = field(default_factory=dict)     # layer -> (S32, vis, K_kv, Q) when capture_inputs
@@ -150,6 +151,7 @@ class MarSeaContext:
 
     def clear_generation(self):
         self.decode_caches = {}
+        self.mesh_caches = {}
         self.generation = False
 
 
@@ -255,6 +257,13 @@ class MarSeaAttention(nn.Module):
         vis = build_vis(ctx.pad_mask, B, n_q, n_k, q.device)                     # [B,1,n_q,n_k]
         if getattr(ctx, "aux_capture", False) and n_q == n_k:
             ctx.aux_qk[self.layer_idx] = (k.detach(), q.detach(), self.scaling)   # the aux block loss recomputes S at the answer rows
+        # ---- causal MESH (B2, 2026-09-23): one warm-started row solve per decode step on the cached duals
+        if ctx.generation and n_q == 1 and isinstance(self.normalizer, MESHNorm) and self.normalizer.causal and not ctx.phase_a \
+                and self.layer_idx in getattr(ctx, "mesh_caches", {}):
+            with torch.autocast(device_type=q.device.type, enabled=False):
+                A_row = self.normalizer.decode_step(ctx.mesh_caches[self.layer_idx], k, q, self.scaling)
+            out = torch.matmul(A_row.to(q.dtype), repeat_kv(v, g))
+            return out.transpose(1, 2)
         # ---- generation: frozen-prefix decode step on cached keys (Sec. 6.4)
         if ctx.generation and n_q == 1 and self.layer_idx in ctx.decode_caches and not ctx.phase_a and not ctx.force_empty \
                 and hasattr(self.normalizer, "tauK"):
@@ -342,7 +351,15 @@ class MarSeaAttention(nn.Module):
             kw = dict(ctx.overrides)
             if ctx.force_empty:
                 kw["logits_override"] = torch.full((1, 1, 1, 1), -1e4, device=S.device)
-            if isinstance(self.normalizer, SoftmaxNorm) or not hasattr(self.normalizer, "tauK"):
+            if isinstance(self.normalizer, MESHNorm) and self.normalizer.causal:
+                # causal MESH: a teacher-forced pass says which rows are the prompt; the generation prefill is all prompt
+                # and seeds the decode cache with the block's duals and the queries
+                n_pre = None if ctx.generation else (int(ctx.n_prefill) if ctx.n_prefill and n_q == n_k else None)
+                A, diag = self.normalizer.normalize(S, vis, k, q, state, n_prefill=n_pre)
+                if ctx.generation and n_q == n_k and n_q > 1:
+                    if getattr(ctx, "mesh_caches", None) is None: ctx.mesh_caches = {}
+                    ctx.mesh_caches[self.layer_idx] = self.normalizer.init_decode(diag, q)
+            elif isinstance(self.normalizer, SoftmaxNorm) or not hasattr(self.normalizer, "tauK"):
                 A, diag = self.normalizer.normalize(S, vis, k, q, state)
             else:
                 # with head blocking, merging the dense diagnostics costs a second full-size copy of every program

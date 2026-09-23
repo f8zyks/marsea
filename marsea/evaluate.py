@@ -360,6 +360,11 @@ def attention_level_qa(diags: dict, l_star: int, h_star: int, ex: QAExample, arm
 def generate_greedy(model, tok, ctx: MarSeaContext, prompt_ids: list, max_new_tokens: int, device="cuda", frozen_prefix=True) -> str:
     ids = torch.tensor([prompt_ids], device=device)
     ctx.n_prefill = None
+    # a causal MESH (B2) decodes through its own cache like MarSea does: the prefill is one block, each new row one solve
+    from .baselines import MESHNorm
+    from .backbone import normalizers as _nms
+    if any(isinstance(nm, MESHNorm) and nm.causal for nm in _nms(model).values()):
+        frozen_prefix = True
     ctx.generation = frozen_prefix; ctx.clear_generation(); ctx.generation = frozen_prefix
     t0 = time.time()
     out = model.generate(input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=max_new_tokens, do_sample=False,
