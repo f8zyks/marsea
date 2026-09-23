@@ -126,7 +126,10 @@ def rng_state():
 def set_rng_state(st):
     torch.set_rng_state(st["torch"])
     if st["cuda"] is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(st["cuda"])
+        # a checkpoint written on a pod with more GPUs carries one generator per
+        # device it had; restore the ones this machine has (the rest are unused)
+        for i, s in enumerate(st["cuda"][: torch.cuda.device_count()]):
+            torch.cuda.set_rng_state(s, i)
     np.random.set_state(st["numpy"]); random.setstate(st["python"])
 
 
