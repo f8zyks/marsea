@@ -797,7 +797,8 @@ def train(cfg: TrainConfig, data, quick_eval=None, monitor=None):
     if not phase_a_path.exists():
         print(f"[phase A] training {phase_a_path}")
         model, tok, ctx, layers = build_model(cfg, phase_a=True)
-        readme["phase_a_kernel_check"] = phase_a_kernel_check(model, ctx, data, cfg, layers)
+        readme["config"]["patched_layers"] = list(cfg.patched_layers)       # the RESOLVED layers (build_model wrote them back); the
+        readme["phase_a_kernel_check"] = phase_a_kernel_check(model, ctx, data, cfg, layers)   # README used to keep the provisional default
         opt = make_optimizer(model, cfg, with_modules=False)
         cursor = 0
         model.train()
@@ -843,6 +844,7 @@ def train(cfg: TrainConfig, data, quick_eval=None, monitor=None):
         print("B5 has no training (evaluation-only on B0's weights, D-29)"); return
     # ---------------- Phase B
     model, tok, ctx, layers = build_model(cfg, phase_a=False)
+    readme.setdefault("config", {})["patched_layers"] = list(cfg.patched_layers)   # resolved layers (a run that skipped Phase A too)
     ck = load_checkpoint(phase_a_path, model)
     cursor = ck["cursor"]; step0 = cfg.phase_a_steps
     opt = make_optimizer(model, cfg, with_modules=False)
