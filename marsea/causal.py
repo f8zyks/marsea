@@ -275,6 +275,8 @@ def decode_step(norm: MarSeaNormalizer, cache: FrozenPrefixCache, S_row: torch.T
     # ---- incremental inherited quota and the per-key re-solve at FROZEN tau_j
     E_j = E_row[..., 0, :]                                                       # [B,H,n_k]
     s_j = S32[..., 0, :].masked_fill(~vis[..., 0, :], 0.0)
+    if getattr(norm, "active_direction", None) == "column" and getattr(norm, "col_rownorm", False):
+        s_j = torch.log(A_sm[..., 0, :].clamp_min(1e-38)).masked_fill(~vis[..., 0, :], 0.0)   # row-normalised member score (col_rownorm)
     cache.cbar_j = cache.cbar_j + E_j.to(S32.dtype) * A_sm[..., 0, :]
     cache._insert_scores(s_j, E_j, t)
     if cache.rel_count is not None:

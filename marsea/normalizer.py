@@ -306,7 +306,8 @@ class MarSeaNormalizer(nn.Module):
                  tail_share_min: float = 0.0, relation_heads: Optional[list] = None, relation_topk: int = 0,
                  relation_answer_rows_only: bool = False, direction: Optional[str] = None, tau_row: float = 2.0,
                  lam_row: float = 0.0, tau_col: float = 2.0, lam_col: float = 0.0, relation_from_scores: bool = False,
-                 relation_anchor_scores: bool = False, anchor_init_scale: float = 0.1, base: str = "softmax"):
+                 relation_anchor_scores: bool = False, anchor_init_scale: float = 0.1, base: str = "softmax",
+                 col_rownorm: bool = False):
         super().__init__()
         assert quota_mode in ("inherited", "uniform")
         assert gate in ("st", "hard_concrete")
@@ -390,6 +391,12 @@ class MarSeaNormalizer(nn.Module):
         assert base in ("softmax", "softmax_one"), base
         assert base == "softmax" or direction in ("row", "column", "auto"), "softmax_one is a v3 (one-end form) base"
         self.base = base
+        # col_rownorm (owner, 2026-09-25): the column programme's members compete on ROW-NORMALISED scores
+        # z_ij = S_ij - logsumexp_i(S_i.) = log of row i's base-normalised attention on key j -- comparable across rows
+        # (raw S carries each query's own offset, so a globally-high row won every column it belonged to: column
+        # purity .40-.45, own-block mass -0.1 under the column form; relation probe 2026-09-25).  Row form unaffected.
+        assert not col_rownorm or direction in ("column", "auto"), "col_rownorm is a column-programme option"
+        self.col_rownorm = bool(col_rownorm)
         assert direction in (None, "row", "column", "auto")
         self.direction = direction
         self.active_direction = direction if direction in ("row", "column") else None

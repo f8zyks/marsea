@@ -647,3 +647,39 @@ def test_softmax_one_base_whole_model_teacher_forced_equals_cached_decoding():
     with torch.no_grad():
         b1 = model_b1(input_ids=ids, use_cache=False).logits
     assert float((off - b1).abs().max()) < 1e-9
+
+
+# --------------------------------------------------------------------------- column form on row-normalised scores (owner, 2026-09-25)
+@pytest.mark.parametrize("K_ret", [64, 3])
+def test_col_rownorm_members_compete_on_row_normalised_scores_and_decode_equals_teacher_forcing(K_ret):
+    """col_rownorm: the members of column j compete on z_ij = log A_sm[i, j] (row-normalised) instead of raw S_ij, so a row
+    with a globally high logit offset no longer wins every column.  Same quota / tail rules; TF == decode."""
+    kw = dict(rho=0.4, direction="column", tau_col=0.75, lam_col=0.1, relation_topk=4, relation_answer_rows_only=True,
+              relation_heads=[0, 2, 5], base="softmax_one")
+    norm_r, Q, K_kv, S, vis, n_p = _setup(col_rownorm=True, **kw)
+    norm_s, _, _, _, _, _ = _setup(col_rownorm=False, **kw)
+    norm_s.load_state_dict(norm_r.state_dict())
+    # give one answer row a large positive offset on ALL its scores: raw-S competition hands it every column it joins
+    S2 = S.clone(); S2[:, :, n_p + 1, :] += 6.0
+    with torch.no_grad():
+        A_r, d_r = norm_r.normalize(S2, vis, K_kv, Q, State(), n_prefill=n_p, decode_K_ret=K_ret)
+        A_s, d_s = norm_s.normalize(S2, vis, K_kv, Q, State(), n_prefill=n_p, decode_K_ret=K_ret)
+    A_p, A_dec = _by_decoding(norm_r, Q, K_kv, S2, vis, n_p, K_ret)
+    assert float((A_r[:, :, n_p:] - A_dec).abs().max()) < 1e-9 and torch.equal(A_r[:, :, :n_p, :n_p], A_p)   # TF == decode
+    assert torch.equal(d_r.E, d_s.E)                                                    # the relation is the same; only the competition differs
+    assert float((A_r - A_s).abs().max()) > 1e-6                                        # ...and it changes the assignment
+    T = S.shape[-1]; E = d_r.E; Asm = d_r.A_sm
+    # the offset row: under raw S it takes (nearly) the whole quota of every column it is a member of; under z it takes
+    # its row-normalised share, which is NOT larger than the other members' whenever its A_sm on that key is not larger
+    r = n_p + 1
+    for h in (0, 2, 5):
+        for t in range(r, T):
+            for j in range(t + 1):
+                mem = E[0, h, :t + 1, j].clone(); mem[t + 1:] = False
+                if bool(E[0, h, r, j]) and int(mem.sum()) >= 2:
+                    others = [i for i in range(t + 1) if bool(mem[i]) and i != r]
+                    zr = float(torch.log(Asm[0, h, r, j])); zo = max(float(torch.log(Asm[0, h, i, j])) for i in others)
+                    if zo > zr + 1e-6:                                                  # another member is row-normalised-better
+                        assert float(A_r[0, h, r, j]) <= max(float(A_r[0, h, i, j]) for i in others) + 1e-9
+    # rows without a relation and prompt rows: the base normalisation exactly
+    assert torch.equal(A_r[:, [1, 3, 4]], Asm[:, [1, 3, 4]]) and torch.equal(A_r[:, :, :n_p], Asm[:, :, :n_p])

@@ -91,10 +91,12 @@ def normalize_triggered(norm, S: torch.Tensor, vis: torch.Tensor, K_kv: torch.Te
         L_s = torch.full((B, H, n_k, K_ret), NEG_PAD, dtype=dt, device=dev); L_v = torch.zeros((B, H, n_k, K_ret), dtype=torch.bool, device=dev)
         L_s = torch.cat([torch.cat([top0.values.masked_fill(~v0, NEG_PAD), L_s[:, :, :n_p, k0:]], -1), L_s[:, :, n_p:]], -2)
         L_v = torch.cat([torch.cat([v0, L_v[:, :, :n_p, k0:]], -1), L_v[:, :, n_p:]], -2)
-        S_aT = S_a.transpose(-1, -2); E_aT = E_a.transpose(-1, -2)                  # [B,H,n,m]: the answer rows of each key
         trig_tau = getattr(norm, "tauK_trig", None)
         learned_share = getattr(norm, "tail_share_head", None) is not None
         col_form = getattr(norm, "active_direction", None) == "column"
+        # the members' competition scores: raw S, or (col_rownorm) the row-normalised z = log A_sm -- see MarSeaNormalizer
+        Sc_a = torch.log(A_sm_a.clamp_min(1e-38)) if (col_form and getattr(norm, "col_rownorm", False)) else S_a
+        S_aT = Sc_a.transpose(-1, -2); E_aT = E_a.transpose(-1, -2)                 # [B,H,n,m]: the answer rows of each key
         if col_form:
             trig_tau = None                                                          # tau_col is a preset
         if trig_tau is not None or norm.tauQ.sized or learned_share or col_form:     # the TRUE size of each relation set, row by row
